@@ -277,8 +277,8 @@ static u16 tcp_select_window(struct sock *sk)
 	}
 
 	if (tp->mpc) {
-		mpcb_meta_tp(tp->mpcb)->rcv_wnd = new_win;
-		mpcb_meta_tp(tp->mpcb)->rcv_wup = mpcb_meta_tp(tp->mpcb)->rcv_nxt;
+		mptcp_meta_tp(tp)->rcv_wnd = new_win;
+		mptcp_meta_tp(tp)->rcv_wup = mptcp_meta_tp(tp)->rcv_nxt;
 	}
 
 	tp->rcv_wnd = new_win;
@@ -377,12 +377,17 @@ void tcp_init_nondata_skb(struct sk_buff *skb, u32 seq, u8 flags)
 	TCP_SKB_CB(skb)->end_seq = seq;
 }
 
+int tcp_urg_mode(const struct tcp_sock *tp)
+{
+	return tp->snd_una != tp->snd_up;
+}
+
 #define OPTION_SACK_ADVERTISE	(1 << 0)
 #define OPTION_TS		(1 << 1)
 #define OPTION_MD5		(1 << 2)
 #define OPTION_WSCALE		(1 << 3)
 #define OPTION_COOKIE_EXTENSION	(1 << 4)
-/* WARN: Before adding here, consider the MPTCP-option in include/net/mptcp.h */
+/* Before adding here - take a look at OPTION_MPTCP in include/net/mptcp.h */
 
 /* The sysctl int routines are generic, so check consistency here.
  */
@@ -1468,7 +1473,7 @@ static unsigned int tcp_snd_test(struct sock *sk, struct sk_buff *skb,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int cwnd_quota;
-	struct tcp_sock *meta_tp = tp->mpc ? mpcb_meta_tp(tp->mpcb) : tp;
+	const struct tcp_sock *meta_tp = tp->mpc ? mptcp_meta_tp(tp) : tp;
 
 	tcp_init_tso_segs(sk, skb, cur_mss);
 
@@ -1560,9 +1565,6 @@ int tcp_tso_should_defer(struct sock *sk, struct sk_buff *skb)
 	u32 send_win, cong_win, limit, in_flight;
 	int win_divisor;
 
-	/* TSO not supported at the moment in MPTCP */
-	BUG_ON(tp->mpc);
-
 	if (TCP_SKB_CB(skb)->flags & TCPHDR_FIN)
 		goto send_now;
 
@@ -1642,7 +1644,6 @@ int tcp_mtu_probe(struct sock *sk)
 	int size_needed;
 	int copy;
 	int mss_now;
-	u32 snd_wnd = (tp->mpc) ? mpcb_meta_tp(tp->mpcb)->snd_wnd : tp->snd_wnd;
 
 	/* Not currently probing/verifying,
 	 * not in recovery,
@@ -1668,7 +1669,7 @@ int tcp_mtu_probe(struct sock *sk)
 	if (tp->write_seq - tp->snd_nxt < size_needed)
 		return -1;
 
-	if (snd_wnd < size_needed)
+	if (tp->snd_wnd < size_needed)
 		return -1;
 	if (after(tp->snd_nxt + size_needed, tcp_wnd_end(tp)))
 		return 0;
@@ -2658,6 +2659,7 @@ static void tcp_connect_init(struct sock *sk)
 
 	if (!tp->window_clamp)
 		tp->window_clamp = dst_metric(dst, RTAX_WINDOW);
+
 	if (mptcp_doit(sk))
 		tp->advmss = mptcp_sysctl_mss();
 	else
@@ -2709,14 +2711,8 @@ static void tcp_connect_init(struct sock *sk)
 
 		tp->request_mptcp = 1;
 
-		if (is_master_tp(tp)) {
-			do {
-				get_random_bytes(&tp->mptcp_loc_key,
-						 sizeof(tp->mptcp_loc_key));
-				mptcp_key_sha1(tp->mptcp_loc_key,
-					       &tp->mptcp_loc_token, NULL);
-			} while (mptcp_find_token(tp->mptcp_loc_token));
-		}
+		if (is_master_tp(tp))
+			mptcp_connect_init(tp);
 	}
 #endif
 }

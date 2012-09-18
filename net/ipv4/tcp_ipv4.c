@@ -380,7 +380,7 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 
 	tp = tcp_sk(sk);
 	if (tp->mpc)
-		meta_sk = mpcb_meta_sk(tcp_sk(sk)->mpcb);
+		meta_sk = mptcp_meta_sk(sk);
 	else
 		meta_sk = sk;
 
@@ -1305,6 +1305,25 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 #define want_cookie 0 /* Argh, why doesn't gcc optimize this :( */
 #endif
 
+	tcp_clear_options(&tmp_opt);
+	tmp_opt.mss_clamp = TCP_MSS_DEFAULT;
+	tmp_opt.user_mss  = tp->rx_opt.user_mss;
+	mopt.dss_csum = 0;
+	mptcp_init_mp_opt(&mopt);
+	tcp_parse_options(skb, &tmp_opt, &hash_location, &mopt, 0);
+
+#ifdef CONFIG_MPTCP
+	if (tmp_opt.saw_mpc && mopt.is_mp_join) {
+		int ret;
+
+		ret = mptcp_do_join_short(skb, &mopt, &tmp_opt);
+		if (ret < 0) {
+			tcp_v4_send_reset(NULL, skb);
+			goto drop;
+		}
+		return -ret;
+	}
+#endif
 	/* Never answer to SYNs send to broadcast or multicast */
 	if (skb_rtable(skb)->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))
 		goto drop;
@@ -1332,13 +1351,6 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1)
 		goto drop;
 
-	tcp_clear_options(&tmp_opt);
-	tmp_opt.mss_clamp = TCP_MSS_DEFAULT;
-	tmp_opt.user_mss  = tp->rx_opt.user_mss;
-	mopt.dss_csum = 0;
-	mptcp_init_mp_opt(&mopt);
-	tcp_parse_options(skb, &tmp_opt, &hash_location, &mopt, 0);
-
 #ifdef CONFIG_MPTCP
 	if (tmp_opt.saw_mpc) {
 		req = inet_reqsk_alloc(&mptcp_request_sock_ops);
@@ -1346,10 +1358,6 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 		if (!req)
 			goto drop;
 
-		/* Must be set to NULL before calling openreq init.
-		 * tcp_openreq_init() uses this to know whether the request
-		 * is a join request or a conn request.
-		 */
 		mptcp_rsk(req)->mpcb = NULL;
 		mptcp_rsk(req)->dss_csum = mopt.dss_csum;
 	} else
@@ -1403,7 +1411,10 @@ int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 		tcp_clear_options(&tmp_opt);
 
 	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
-	tcp_openreq_init(req, &tmp_opt, &mopt, skb);
+	tcp_openreq_init(req, &tmp_opt, skb);
+
+	if (tcp_rsk(req)->saw_mpc)
+		mptcp_reqsk_new_mptcp(req, &tmp_opt, &mopt);
 
 	ireq = inet_rsk(req);
 	ireq->loc_addr = daddr;
@@ -1600,13 +1611,19 @@ struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
 
 	if (nsk) {
 		if (nsk->sk_state != TCP_TIME_WAIT) {
-			bh_lock_sock(nsk);
-			/* We will go into tcp_child_process, who will unlock
-			 * the meta-sk then.
+			/* Don't lock again the meta-sk. It has been locked
+			 * before mptcp_v6_do_rcv.
 			 */
-			if (tcp_sk(nsk)->mpc && is_master_tp(tcp_sk(nsk)))
+			if (is_meta_sk(sk))
+				return nsk;
+
+			if (tcp_sk(nsk)->mpc)
 				bh_lock_sock(mptcp_meta_sk(nsk));
+			else
+				bh_lock_sock(nsk);
+
 			return nsk;
+
 		}
 		inet_twsk_put(inet_twsk(nsk));
 		return NULL;
@@ -1773,7 +1790,7 @@ process:
 		goto do_time_wait;
 
 #ifdef CONFIG_MPTCP
-	if (th->syn && !th->ack) {
+	if (!sk && th->syn && !th->ack) {
 		int ret;
 
 		ret = mptcp_lookup_join(skb);
@@ -1793,7 +1810,7 @@ process:
 	}
 
 	/* Is there a pending request sock for this segment ? */
-	if ((!sk || sk->sk_state == TCP_LISTEN) && mptcp_syn_recv_sock(skb)) {
+	if ((!sk || sk->sk_state == TCP_LISTEN) && mptcp_check_req(skb)) {
 		if (sk)
 			sock_put(sk);
 		return 0;
@@ -1824,15 +1841,6 @@ process:
 	} else {
 		meta_sk = sk;
 		bh_lock_sock_nested(sk);
-
-		/* Socket became mp-capable while waiting for the lock */
-		if (unlikely(tcp_sk(sk)->mpc)) {
-			meta_sk = mptcp_meta_sk(sk);
-
-			bh_unlock_sock(sk);
-			bh_lock_sock_nested(meta_sk);
-			skb->sk = sk;
-		}
 	}
 
 	ret = 0;
@@ -1846,7 +1854,7 @@ process:
 		else
 #endif
 		{
-			if (!tcp_prequeue(sk, skb))
+			if (!tcp_prequeue(meta_sk, skb))
 				ret = tcp_v4_do_rcv(sk, skb);
 		}
 	} else if (unlikely(sk_add_backlog(meta_sk, skb))) {
@@ -2085,6 +2093,8 @@ void tcp_v4_destroy_sock(struct sock *sk)
 		mptcp_purge_ofo_queue(tp);
 	} else {
 		mptcp_del_sock(sk);
+		if (tp->inside_tk_table)
+			mptcp_hash_remove(tp);
 		__skb_queue_purge(&tp->out_of_order_queue);
 	}
 
@@ -2103,8 +2113,7 @@ void tcp_v4_destroy_sock(struct sock *sk)
 #endif
 
 	/* Clean prequeue, it must be empty really */
-	if (!is_meta_sk(sk))
-		__skb_queue_purge(&tp->ucopy.prequeue);
+	__skb_queue_purge(&tp->ucopy.prequeue);
 
 	/* Clean up a referenced TCP bind bucket. */
 	if (inet_csk(sk)->icsk_bind_hash)

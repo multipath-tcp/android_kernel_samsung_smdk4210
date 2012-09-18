@@ -362,23 +362,9 @@ extern void __pskb_trim_head(struct sk_buff *skb, int len);
 extern void tcp_queue_skb(struct sock *sk, struct sk_buff *skb);
 extern void tcp_init_nondata_skb(struct sk_buff *skb, u32 seq, u8 flags);
 extern void tcp_reset(struct sock *sk);
-
-/* Check that window update is acceptable.
- * The function assumes that snd_una<=ack<=snd_next.
- */
-static inline int tcp_may_update_window(const struct tcp_sock *tp,
-					const u32 ack, const u32 ack_seq,
-					const u32 nwin)
-{
-	return	after(ack, tp->snd_una) ||
-		after(ack_seq, tp->snd_wl1) ||
-		(ack_seq == tp->snd_wl1 && nwin > tp->snd_wnd);
-}
-
-static inline int tcp_urg_mode(const struct tcp_sock *tp)
-{
-	return tp->snd_una != tp->snd_up;
-}
+extern int tcp_may_update_window(const struct tcp_sock *tp, const u32 ack,
+				 const u32 ack_seq, const u32 nwin);
+extern int tcp_urg_mode(const struct tcp_sock *tp);
 
 extern int tcp_v4_rtx_synack(struct sock *sk, struct request_sock *req,
 			     struct request_values *rvp);
@@ -406,8 +392,12 @@ extern int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 extern void tcp_v6_destroy_sock(struct sock *sk);
 extern void tcp_v6_hash(struct sock *sk);
 extern struct sock *tcp_v6_hnd_req(struct sock *sk,struct sk_buff *skb);
-
-
+extern void __tcp_v6_send_check(struct sk_buff *skb,
+				const struct in6_addr *saddr,
+				const struct in6_addr *daddr);
+extern struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+					 struct request_sock *req,
+					 struct dst_entry *dst);
 /**** END - Exports needed for MPTCP ****/
 
 extern void tcp_v4_err(struct sk_buff *skb, u32);
@@ -705,6 +695,11 @@ extern u32 __tcp_select_window(struct sock *sk);
 #define MPTCPHDR_SEQ64_OFO	0x20 /* Is it not in our circular array? */
 #define MPTCPHDR_SEQ64_INDEX	0x40 /* Index of seq in mpcb->snd_high_order */
 #define MPTCPHDR_ACK64_SET	0x80
+
+/* It is impossible, that all 8 bits of mptcp_flags are set to 1 with the above
+ * Thus, defining MPTCPHDR_JOIN as 0xFF is safe.
+ */
+#define MPTCPHDR_JOIN		0xFF
 
 /* This is what the send packet queuing engine uses to pass
  * TCP per-packet control information to the transmission code.
@@ -1012,7 +1007,45 @@ static inline void tcp_prequeue_init(struct tcp_sock *tp)
 #endif
 }
 
-extern int tcp_prequeue(struct sock *sk, struct sk_buff *skb);
+/* Packet is added to VJ-style prequeue for processing in process
+ * context, if a reader task is waiting. Apparently, this exciting
+ * idea (VJ's mail "Re: query about TCP header on tcp-ip" of 07 Sep 93)
+ * failed somewhere. Latency? Burstiness? Well, at least now we will
+ * see, why it failed. 8)8)				  --ANK
+ *
+ * NOTE: is this not too big to inline?
+ */
+static inline int tcp_prequeue(struct sock *sk, struct sk_buff *skb)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	if (sysctl_tcp_low_latency || !tp->ucopy.task)
+		return 0;
+
+	__skb_queue_tail(&tp->ucopy.prequeue, skb);
+	tp->ucopy.memory += skb->truesize;
+	if (tp->ucopy.memory > sk->sk_rcvbuf) {
+		struct sk_buff *skb1;
+
+		BUG_ON(sock_owned_by_user(sk));
+
+		while ((skb1 = __skb_dequeue(&tp->ucopy.prequeue)) != NULL) {
+			sk_backlog_rcv(sk, skb1);
+			NET_INC_STATS_BH(sock_net(sk),
+					 LINUX_MIB_TCPPREQUEUEDROPPED);
+		}
+
+		tp->ucopy.memory = 0;
+	} else if (skb_queue_len(&tp->ucopy.prequeue) == 1) {
+		wake_up_interruptible_sync_poll(sk_sleep(sk),
+					   POLLIN | POLLRDNORM | POLLRDBAND);
+		if (!inet_csk_ack_scheduled(sk) && !tp->mpc)
+			inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK,
+						  (3 * tcp_rto_min(sk)) / 4,
+						  TCP_RTO_MAX);
+	}
+	return 1;
+}
 
 #undef STATE_TRACE
 
@@ -1050,7 +1083,7 @@ static inline int tcp_win_from_space(int space)
 static inline int tcp_space(const struct sock *sk)
 {
 	if (tcp_sk(sk)->mpc)
-		sk = (struct sock *) (tcp_sk(sk)->mpcb);
+		sk = tcp_sk(sk)->meta_sk;
 
 	return tcp_win_from_space(sk->sk_rcvbuf -
 				  atomic_read(&sk->sk_rmem_alloc));
@@ -1059,15 +1092,32 @@ static inline int tcp_space(const struct sock *sk)
 static inline int tcp_full_space(const struct sock *sk)
 {
 	if (tcp_sk(sk)->mpc)
-		sk = (struct sock *) (tcp_sk(sk)->mpcb);
+		sk = tcp_sk(sk)->meta_sk;
 
 	return tcp_win_from_space(sk->sk_rcvbuf); 
 }
 
-extern void tcp_openreq_init(struct request_sock *req,
-			     struct tcp_options_received *rx_opt,
-			     struct multipath_options *mopt,
-			     struct sk_buff *skb);
+static inline void tcp_openreq_init(struct request_sock *req,
+				    struct tcp_options_received *rx_opt,
+				    struct sk_buff *skb)
+{
+	struct inet_request_sock *ireq = inet_rsk(req);
+
+	req->rcv_wnd = 0;		/* So that tcp_send_synack() knows! */
+	req->cookie_ts = 0;
+	tcp_rsk(req)->rcv_isn = TCP_SKB_CB(skb)->seq;
+	tcp_rsk(req)->saw_mpc = rx_opt->saw_mpc;
+	req->mss = rx_opt->mss_clamp;
+	req->ts_recent = rx_opt->saw_tstamp ? rx_opt->rcv_tsval : 0;
+	ireq->tstamp_ok = rx_opt->tstamp_ok;
+	ireq->sack_ok = rx_opt->sack_ok;
+	ireq->snd_wscale = rx_opt->snd_wscale;
+	ireq->wscale_ok = rx_opt->wscale_ok;
+	ireq->acked = 0;
+	ireq->ecn_ok = 0;
+	ireq->rmt_port = tcp_hdr(skb)->source;
+	ireq->loc_port = tcp_hdr(skb)->dest;
+}
 
 extern void tcp_enter_memory_pressure(struct sock *sk);
 

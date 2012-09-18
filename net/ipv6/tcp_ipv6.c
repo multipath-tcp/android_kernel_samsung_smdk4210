@@ -73,10 +73,6 @@
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
 
-static void	__tcp_v6_send_check(struct sk_buff *skb,
-				    const struct in6_addr *saddr,
-				    const struct in6_addr *daddr);
-
 #ifdef CONFIG_TCP_MD5SIG
 static const struct tcp_sock_af_ops tcp_sock_ipv6_mapped_specific;
 #else
@@ -351,7 +347,7 @@ static void tcp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 
 	tp = tcp_sk(sk);
 	if (tp->mpc)
-		meta_sk = mpcb_meta_sk(tp->mpcb);
+		meta_sk = mptcp_meta_sk(sk);
 	else
 		meta_sk = sk;
 
@@ -916,8 +912,8 @@ static const struct tcp_request_sock_ops tcp_request_sock_ipv6_ops = {
 };
 #endif
 
-static void __tcp_v6_send_check(struct sk_buff *skb,
-				const struct in6_addr *saddr, const struct in6_addr *daddr)
+void __tcp_v6_send_check(struct sk_buff *skb,
+			 const struct in6_addr *saddr, const struct in6_addr *daddr)
 {
 	struct tcphdr *th = tcp_hdr(skb);
 
@@ -1198,12 +1194,17 @@ struct sock *tcp_v6_hnd_req(struct sock *sk,struct sk_buff *skb)
 
 	if (nsk) {
 		if (nsk->sk_state != TCP_TIME_WAIT) {
-			bh_lock_sock(nsk);
-			/* We will go into tcp_child_process, who will unlock
-			 * the meta-sk then.
+			/* Don't lock again the meta-sk. It has been locked
+			 * before mptcp_v6_do_rcv.
 			 */
-			if (tcp_sk(nsk)->mpc && is_master_tp(tcp_sk(nsk)))
+			if (is_meta_sk(sk))
+				return nsk;
+
+			if (tcp_sk(nsk)->mpc)
 				bh_lock_sock(mptcp_meta_sk(nsk));
+			else
+				bh_lock_sock(nsk);
+
 			return nsk;
 		}
 		inet_twsk_put(inet_twsk(nsk));
@@ -1241,6 +1242,27 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 	if (skb->protocol == htons(ETH_P_IP))
 		return tcp_v4_conn_request(sk, skb);
 
+	tcp_clear_options(&tmp_opt);
+	tmp_opt.mss_clamp = IPV6_MIN_MTU - sizeof(struct tcphdr) -
+				sizeof(struct ipv6hdr);
+	tmp_opt.user_mss = tp->rx_opt.user_mss;
+	mopt.dss_csum = 0;
+	mptcp_init_mp_opt(&mopt);
+	tcp_parse_options(skb, &tmp_opt, &hash_location, &mopt, 0);
+
+#ifdef CONFIG_MPTCP
+	if (tmp_opt.saw_mpc && mopt.is_mp_join) {
+		int ret;
+
+		ret = mptcp_do_join_short(skb, &mopt, &tmp_opt);
+		if (ret < 0) {
+			tcp_v6_send_reset(NULL, skb);
+			goto drop;
+		}
+		return -ret;
+	}
+#endif
+
 	if (!ipv6_unicast_destination(skb))
 		goto drop;
 
@@ -1258,13 +1280,6 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1)
 		goto drop;
 
-	tcp_clear_options(&tmp_opt);
-	tmp_opt.mss_clamp = IPV6_MIN_MTU - sizeof(struct tcphdr) - sizeof(struct ipv6hdr);
-	tmp_opt.user_mss = tp->rx_opt.user_mss;
-	mopt.dss_csum = 0;
-	mptcp_init_mp_opt(&mopt);
-	tcp_parse_options(skb, &tmp_opt, &hash_location, &mopt, 0);
-
 #ifdef CONFIG_MPTCP
 	if (tmp_opt.saw_mpc) {
 		req = inet6_reqsk_alloc(&mptcp6_request_sock_ops);
@@ -1272,10 +1287,6 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 		if (req == NULL)
 			goto drop;
 
-		/* Must be set to NULL before calling openreq init.
-		 * tcp_openreq_init() uses this to know whether the request
-		 * is a join request or a conn request.
-		 */
 		mptcp_rsk(req)->mpcb = NULL;
 		mptcp_rsk(req)->dss_csum = mopt.dss_csum;
 	} else
@@ -1339,7 +1350,11 @@ static int tcp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
 
 	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
 
-	tcp_openreq_init(req, &tmp_opt, &mopt, skb);
+	tcp_openreq_init(req, &tmp_opt, skb);
+
+	tcp_rsk(req)->saw_mpc = tmp_opt.saw_mpc;
+	if (tmp_opt.saw_mpc)
+		mptcp_reqsk_new_mptcp(req, &tmp_opt, &mopt);
 
 	treq = inet6_rsk(req);
 	ipv6_addr_copy(&treq->rmt_addr, &ipv6_hdr(skb)->saddr);
@@ -1434,8 +1449,8 @@ drop:
 }
 
 struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
-					  struct request_sock *req,
-					  struct dst_entry *dst)
+				  struct request_sock *req,
+				  struct dst_entry *dst)
 {
 	struct inet6_request_sock *treq;
 	struct ipv6_pinfo *newnp, *np = inet6_sk(sk);
@@ -1833,7 +1848,7 @@ process:
 		goto do_time_wait;
 
 #ifdef CONFIG_MPTCP
-	if (th->syn && !th->ack) {
+	if (!sk && th->syn && !th->ack) {
 		int ret;
 
 		ret = mptcp_lookup_join(skb);
@@ -1852,7 +1867,7 @@ process:
 	}
 
 	/* Is there a pending request sock for this segment ? */
-	if ((!sk || sk->sk_state == TCP_LISTEN) && mptcp_syn_recv_sock(skb)) {
+	if ((!sk || sk->sk_state == TCP_LISTEN) && mptcp_check_req(skb)) {
 		if (sk)
 			sock_put(sk);
 		return 0;
@@ -1883,15 +1898,6 @@ process:
 	} else {
 		meta_sk = sk;
 		bh_lock_sock_nested(sk);
-
-		/* Socket became mp-capable while waiting for the lock */
-		if (unlikely(tcp_sk(sk)->mpc)) {
-			meta_sk = mptcp_meta_sk(sk);
-
-			bh_unlock_sock(sk);
-			bh_lock_sock_nested(meta_sk);
-			skb->sk = sk;
-		}
 	}
 
 	ret = 0;
@@ -1905,7 +1911,7 @@ process:
 		else
 #endif
 		{
-			if (!tcp_prequeue(sk, skb))
+			if (!tcp_prequeue(meta_sk, skb))
 				ret = tcp_v6_do_rcv(sk, skb);
 		}
 	} else if (unlikely(sk_add_backlog(meta_sk, skb))) {

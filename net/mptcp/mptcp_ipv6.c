@@ -32,55 +32,18 @@
 
 #include <net/flow.h>
 #include <net/inet6_connection_sock.h>
+#include <net/inet6_hashtables.h>
 #include <net/inet_common.h>
 #include <net/ipv6.h>
+#include <net/ip6_route.h>
 #include <net/mptcp.h>
 #include <net/mptcp_pm.h>
 #include <net/mptcp_v6.h>
 #include <net/tcp.h>
+#include <net/transp_v6.h>
 #include <net/addrconf.h>
 
 #define AF_INET6_FAMILY(fam) ((fam) == AF_INET6)
-
-struct proto mptcpv6_prot = {
-	.name			= "MPTCPv6",
-	.owner			= THIS_MODULE,
-	.close			= mptcp_close,
-	.connect		= tcp_v6_connect,
-	.disconnect		= tcp_disconnect,
-	.accept			= inet_csk_accept,
-	.ioctl			= tcp_ioctl,
-	.destroy		= tcp_v6_destroy_sock,
-	.shutdown		= tcp_shutdown,
-	.setsockopt		= tcp_setsockopt,
-	.getsockopt		= tcp_getsockopt,
-	.recvmsg		= tcp_recvmsg,
-	.sendmsg		= tcp_sendmsg,
-	.sendpage		= tcp_sendpage,
-	.backlog_rcv		= mptcp_backlog_rcv,
-	.hash			= tcp_v6_hash,
-	.unhash			= inet_unhash,
-	.get_port		= inet_csk_get_port,
-	.enter_memory_pressure	= tcp_enter_memory_pressure,
-	.sockets_allocated	= &tcp_sockets_allocated,
-	.memory_allocated	= &tcp_memory_allocated,
-	.memory_pressure	= &tcp_memory_pressure,
-	.orphan_count		= &tcp_orphan_count,
-	.sysctl_mem		= sysctl_tcp_mem,
-	.sysctl_wmem		= sysctl_tcp_wmem,
-	.sysctl_rmem		= sysctl_tcp_rmem,
-	.max_header		= MAX_TCP_HEADER,
-	.obj_size		= sizeof(struct mptcp_cb),
-	.slab_flags		= SLAB_DESTROY_BY_RCU,
-	.twsk_prot		= NULL,
-	.rsk_prot		= &mptcp6_request_sock_ops,
-	.h.hashinfo		= &tcp_hashinfo,
-	.no_autobind		= true,
-#ifdef CONFIG_COMPAT
-	.compat_setsockopt	= compat_tcp_setsockopt,
-	.compat_getsockopt	= compat_tcp_getsockopt,
-#endif
-};
 
 static void mptcp_v6_reqsk_destructor(struct request_sock *req)
 {
@@ -103,8 +66,7 @@ static void mptcp_v6_reqsk_queue_hash_add(struct request_sock *req,
 				      unsigned long timeout)
 {
 
-	struct inet_connection_sock *meta_icsk =
-		(struct inet_connection_sock *)(mptcp_rsk(req)->mpcb);
+	struct inet_connection_sock *meta_icsk = inet_csk(mptcp_rsk(req)->mpcb->meta_sk);
 	struct listen_sock *lopt = meta_icsk->icsk_accept_queue.listen_opt;
 	const u32 h_local = inet6_synq_hash(&inet6_rsk(req)->rmt_addr,
 					   inet_rsk(req)->rmt_port,
@@ -122,18 +84,177 @@ static void mptcp_v6_reqsk_queue_hash_add(struct request_sock *req,
 	spin_unlock_bh(&mptcp_reqsk_hlock);
 }
 
-static void mptcp_v6_join_request(struct mptcp_cb *mpcb, struct sk_buff *skb)
+/* The meta-socket is IPv4, but a new subsocket is IPv6 */
+static int mptcp_v6v4_send_synack(struct sock *sk, struct request_sock *req,
+				  struct request_values *rvp)
 {
-	struct sock *meta_sk = mpcb_meta_sk(mpcb);
+	struct inet6_request_sock *treq = inet6_rsk(req);
+	struct sk_buff * skb;
+	struct flowi6 fl6;
+	struct dst_entry *dst;
+	int err;
+
+	memset(&fl6, 0, sizeof(fl6));
+	fl6.flowi6_proto = IPPROTO_TCP;
+	ipv6_addr_copy(&fl6.daddr, &treq->rmt_addr);
+	ipv6_addr_copy(&fl6.saddr, &treq->loc_addr);
+	fl6.flowlabel = 0;
+	fl6.flowi6_oif = treq->iif;
+	fl6.flowi6_mark = sk->sk_mark;
+	fl6.fl6_dport = inet_rsk(req)->rmt_port;
+	fl6.fl6_sport = inet_rsk(req)->loc_port;
+	security_req_classify_flow(req, flowi6_to_flowi(&fl6));
+
+	dst = ip6_dst_lookup_flow(sk, &fl6, NULL, false);
+	if (IS_ERR(dst)) {
+		err = PTR_ERR(dst);
+		dst = NULL;
+		goto done;
+	}
+	skb = tcp_make_synack(sk, dst, req, rvp);
+	err = -ENOMEM;
+	if (skb) {
+		__tcp_v6_send_check(skb, &treq->loc_addr, &treq->rmt_addr);
+
+		ipv6_addr_copy(&fl6.daddr, &treq->rmt_addr);
+		err = ip6_xmit(sk, skb, &fl6, NULL);
+		err = net_xmit_eval(err);
+	}
+
+done:
+	dst_release(dst);
+	return err;
+}
+
+/* The meta-socket is IPv4, but a new subsocket is IPv6 */
+struct sock *mptcp_v6v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
+				      struct request_sock *req,
+				      struct dst_entry *dst)
+{
+	struct inet6_request_sock *treq;
+	struct ipv6_pinfo *newnp;
+	struct tcp6_sock *newtcp6sk;
+	struct inet_sock *newinet;
+	struct tcp_sock *newtp;
+	struct sock *newsk;
+
+	treq = inet6_rsk(req);
+
+	if (sk_acceptq_is_full(sk))
+		goto out_overflow;
+
+	if (!dst) {
+		struct flowi6 fl6;
+
+		memset(&fl6, 0, sizeof(fl6));
+		fl6.flowi6_proto = IPPROTO_TCP;
+		ipv6_addr_copy(&fl6.daddr, &treq->rmt_addr);
+		ipv6_addr_copy(&fl6.saddr, &treq->loc_addr);
+		fl6.flowi6_oif = sk->sk_bound_dev_if;
+		fl6.flowi6_mark = sk->sk_mark;
+		fl6.fl6_dport = inet_rsk(req)->rmt_port;
+		fl6.fl6_sport = inet_rsk(req)->loc_port;
+		security_req_classify_flow(req, flowi6_to_flowi(&fl6));
+
+		dst = ip6_dst_lookup_flow(sk, &fl6, NULL, false);
+
+		if (IS_ERR(dst))
+			goto out;
+	}
+
+	newsk = tcp_create_openreq_child(sk, req, skb);
+	if (newsk == NULL)
+		goto out_nonewsk;
+
+	/*
+	 * No need to charge this sock to the relevant IPv6 refcnt debug socks
+	 * count here, tcp_create_openreq_child now does this for us, see the
+	 * comment in that function for the gory details. -acme
+	 */
+
+	newsk->sk_gso_type = SKB_GSO_TCPV6;
+	sk_setup_caps(newsk, dst);
+
+	newtcp6sk = (struct tcp6_sock *)newsk;
+	inet_sk(newsk)->pinet6 = &newtcp6sk->inet6;
+
+	newtp = tcp_sk(newsk);
+	newinet = inet_sk(newsk);
+	newnp = inet6_sk(newsk);
+
+	ipv6_addr_copy(&newnp->daddr, &treq->rmt_addr);
+	ipv6_addr_copy(&newnp->saddr, &treq->loc_addr);
+	ipv6_addr_copy(&newnp->rcv_saddr, &treq->loc_addr);
+	newsk->sk_bound_dev_if = treq->iif;
+
+	/* Now IPv6 options...
+
+	   First: no IPv4 options.
+	 */
+	newinet->inet_opt = NULL;
+	newnp->ipv6_ac_list = NULL;
+	newnp->ipv6_fl_list = NULL;
+	newnp->rxopt.all = 0;
+
+	/* Clone pktoptions received with SYN */
+	newnp->pktoptions = NULL;
+	if (treq->pktopts != NULL) {
+		newnp->pktoptions = skb_clone(treq->pktopts, GFP_ATOMIC);
+		kfree_skb(treq->pktopts);
+		treq->pktopts = NULL;
+		if (newnp->pktoptions)
+			skb_set_owner_r(newnp->pktoptions, newsk);
+	}
+	newnp->opt	  = NULL;
+	newnp->mcast_oif  = inet6_iif(skb);
+	newnp->mcast_hops = ipv6_hdr(skb)->hop_limit;
+
+	/* Initialization copied from inet6_create */
+	newnp->hop_limit  = -1;
+	newnp->mc_loop	  = 1;
+	newnp->pmtudisc	  = IPV6_PMTUDISC_WANT;
+
+	inet_csk(newsk)->icsk_ext_hdr_len = 0;
+
+	tcp_mtup_init(newsk);
+	tcp_sync_mss(newsk, dst_mtu(dst));
+	newtp->advmss = dst_metric_advmss(dst);
+	tcp_initialize_rcv_mss(newsk);
+	newtp->total_retrans = req->retrans;
+
+	newinet->inet_daddr = newinet->inet_saddr = LOOPBACK4_IPV6;
+	newinet->inet_rcv_saddr = LOOPBACK4_IPV6;
+
+	if (__inet_inherit_port(sk, newsk) < 0) {
+		sock_put(newsk);
+		goto out;
+	}
+	__inet6_hash(newsk, NULL);
+
+	return newsk;
+
+out_overflow:
+	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+out_nonewsk:
+	dst_release(dst);
+out:
+	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+	return NULL;
+}
+
+/* from mptcp_v6_join_request() */
+static void mptcp_v6_join_request_short(struct sock *meta_sk,
+					struct sk_buff *skb,
+					struct tcp_options_received *tmp_opt)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
 	struct ipv6_pinfo *np = inet6_sk(meta_sk);
 	struct request_sock *req, **prev;
 	struct inet6_request_sock *treq;
 	struct mptcp_request_sock *mtreq;
-	struct tcp_options_received tmp_opt;
 	u8 mptcp_hash_mac[20];
 	struct in6_addr saddr;
 	struct in6_addr daddr;
-	const u8 *hash_location;
 	__u32 isn = TCP_SKB_CB(skb)->when;
 
 	ipv6_addr_copy(&saddr, &ipv6_hdr(skb)->saddr);
@@ -143,16 +264,11 @@ static void mptcp_v6_join_request(struct mptcp_cb *mpcb, struct sk_buff *skb)
 	if (!req)
 		return;
 
-	tcp_clear_options(&tmp_opt);
-	tmp_opt.mss_clamp = TCP_MSS_DEFAULT;
-	tmp_opt.user_mss  = mpcb_meta_tp(mpcb)->rx_opt.user_mss;
-	tcp_parse_options(skb, &tmp_opt, &hash_location, &mpcb->rx_opt, 0);
-
-	tmp_opt.tstamp_ok = tmp_opt.saw_tstamp;
+	tmp_opt->tstamp_ok = tmp_opt->saw_tstamp;
 
 	mtreq = mptcp_rsk(req);
 	mtreq->mpcb = mpcb;
-	mtreq->mptcp_rem_nonce = mpcb->rx_opt.mptcp_recv_nonce;
+	mtreq->mptcp_rem_nonce = tmp_opt->mptcp_recv_nonce;
 	mtreq->mptcp_rem_key = mpcb->rx_opt.mptcp_rem_key;
 	mtreq->mptcp_loc_key = mpcb->mptcp_loc_key;
 
@@ -165,17 +281,20 @@ static void mptcp_v6_join_request(struct mptcp_cb *mpcb, struct sk_buff *skb)
 			(u8 *)&mtreq->mptcp_rem_nonce, (u32 *)mptcp_hash_mac);
 	mtreq->mptcp_hash_tmac = *(u64 *)mptcp_hash_mac;
 
-	mtreq->rem_id = tmp_opt.rem_id;
-	mtreq->low_prio = tmp_opt.low_prio;
-	tcp_openreq_init(req, &tmp_opt, NULL, skb);
+	mtreq->rem_id = tmp_opt->rem_id;
+	mtreq->low_prio = tmp_opt->low_prio;
+
+	tcp_openreq_init(req, tmp_opt, skb);
 
 	treq = inet6_rsk(req);
 	ipv6_addr_copy(&treq->loc_addr, &daddr);
 	ipv6_addr_copy(&treq->rmt_addr, &saddr);
 
-	if (ipv6_opt_accepted(meta_sk, skb) ||
-	    np->rxopt.bits.rxinfo || np->rxopt.bits.rxoinfo ||
-	    np->rxopt.bits.rxhlim || np->rxopt.bits.rxohlim) {
+	/* Meta may be IPv4-only - then we should not do the below */
+	if (meta_sk->sk_family == AF_INET6 &&
+	    (ipv6_opt_accepted(meta_sk, skb) ||
+	     np->rxopt.bits.rxinfo || np->rxopt.bits.rxoinfo ||
+	     np->rxopt.bits.rxhlim || np->rxopt.bits.rxohlim)) {
 		atomic_inc(&skb->users);
 		treq->pktopts = skb;
 	}
@@ -191,17 +310,35 @@ static void mptcp_v6_join_request(struct mptcp_cb *mpcb, struct sk_buff *skb)
 	/* Adding to request queue in metasocket */
 	mptcp_v6_reqsk_queue_hash_add(req, TCP_TIMEOUT_INIT);
 
-	if (tcp_v6_send_synack(mpcb_meta_sk(mpcb), req, NULL))
-		goto drop_and_free;
+	if (meta_sk->sk_family == AF_INET6) {
+		if (tcp_v6_send_synack(meta_sk, req, NULL))
+			goto drop_and_free;
+	} else {
+		if (mptcp_v6v4_send_synack(meta_sk, req, NULL))
+			goto drop_and_free;
+	}
 
 	return;
 
 drop_and_free:
-	req = inet6_csk_search_req(mpcb_meta_sk(mpcb), &prev,
-				   inet_rsk(req)->rmt_port, &saddr, &daddr,
-				   inet6_iif(skb));
-	inet_csk_reqsk_queue_drop(mpcb_meta_sk(mpcb), req, prev);
+	req = inet6_csk_search_req(meta_sk, &prev, inet_rsk(req)->rmt_port,
+				   &saddr, &daddr, inet6_iif(skb));
+	inet_csk_reqsk_queue_drop(meta_sk, req, prev);
 	return;
+}
+
+static void mptcp_v6_join_request(struct sock *meta_sk, struct sk_buff *skb)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct tcp_options_received tmp_opt;
+	const u8 *hash_location;
+
+	tcp_clear_options(&tmp_opt);
+	tmp_opt.mss_clamp = TCP_MSS_DEFAULT;
+	tmp_opt.user_mss  = tcp_sk(meta_sk)->rx_opt.user_mss;
+	tcp_parse_options(skb, &tmp_opt, &hash_location, &mpcb->rx_opt, 0);
+
+	mptcp_v6_join_request_short(meta_sk, skb, &tmp_opt);
 }
 
 int mptcp_v6_rem_raddress(struct multipath_options *mopt, u8 id)
@@ -297,18 +434,74 @@ void mptcp_v6_set_init_addr_bit(struct mptcp_cb *mpcb,
 }
 
 /**
- * We only process join requests here. (either the SYN or the final ACK)
+ * Fast processing for SYN+MP_JOIN.
  */
-int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
+void mptcp_v6_do_rcv_join_syn(struct sock *meta_sk, struct sk_buff *skb,
+			      struct tcp_options_received *tmp_opt)
 {
-	struct mptcp_cb *mpcb = (struct mptcp_cb *)meta_sk;
-	struct sock *child;
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+
+#ifdef CONFIG_TCP_MD5SIG
+	if (tcp_v6_inbound_md5_hash(meta_sk, skb))
+		return;
+#endif
 
 	/* Has been removed from the tk-table. Thus, no new subflows.
 	 * Check for close-state is necessary, because we may have been closed
 	 * without passing by mptcp_close().
 	 */
-	if (meta_sk->sk_state == TCP_CLOSE || list_empty(&mpcb->collide_tk))
+	if (meta_sk->sk_state == TCP_CLOSE || !tcp_sk(meta_sk)->inside_tk_table)
+		goto reset;
+
+	if (mptcp_v6_add_raddress(&mpcb->rx_opt,
+			(struct in6_addr *)&ipv6_hdr(skb)->saddr, 0,
+			tmp_opt->mpj_addr_id) < 0) {
+		tcp_v6_send_reset(NULL, skb);
+		return;
+	}
+	mpcb->rx_opt.list_rcvd = 0;
+	mptcp_v6_join_request_short(meta_sk, skb, tmp_opt);
+	return;
+
+reset:
+	tcp_v6_send_reset(NULL, skb);
+	return;
+}
+
+/**
+ * We only process join requests here. (either the SYN or the final ACK)
+ */
+int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
+{
+	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
+	struct sock *child;
+
+	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)) {
+		struct tcphdr *th = tcp_hdr(skb);
+		struct sock *sk;
+
+		sk = __inet6_lookup_established(sock_net(meta_sk), &tcp_hashinfo,
+				&ipv6_hdr(skb)->saddr, th->source,
+				&ipv6_hdr(skb)->daddr, ntohs(th->dest), inet6_iif(skb));
+
+		if (is_meta_sk(sk)) {
+			WARN("%s Did not find a sub-sk!\n", __func__);
+			return 0;
+		}
+		if (!sk) {
+			WARN("%s Did not find a sub-sk at all!!!\n", __func__);
+			return 0;
+		}
+
+		return tcp_v6_do_rcv(sk, skb);
+	}
+	TCP_SKB_CB(skb)->mptcp_flags = 0;
+
+	/* Has been removed from the tk-table. Thus, no new subflows.
+	 * Check for close-state is necessary, because we may have been closed
+	 * without passing by mptcp_close().
+	 */
+	if (meta_sk->sk_state == TCP_CLOSE || !tcp_sk(meta_sk)->inside_tk_table)
 		goto reset_and_discard;
 
 	child = tcp_v6_hnd_req(meta_sk, skb);
@@ -317,7 +510,13 @@ int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 		goto discard;
 
 	if (child != meta_sk) {
-		tcp_child_process(meta_sk, child, skb);
+		sock_rps_save_rxhash(child, skb->rxhash);
+		/* We don't call tcp_child_process here, because we hold
+		 * already the meta-sk-lock and are sure that it is not owned
+		 * by the user.
+		 */
+		tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb->len);
+		sock_put(child);
 	} else {
 		if (tcp_hdr(skb)->syn) {
 			struct mp_join *join_opt = mptcp_find_join(skb);
@@ -327,10 +526,9 @@ int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 					(struct in6_addr *)&ipv6_hdr(skb)->saddr, 0,
 					join_opt->addr_id) < 0)
 				goto reset_and_discard;
-			if (mpcb->rx_opt.list_rcvd)
-				mpcb->rx_opt.list_rcvd = 0;
+			mpcb->rx_opt.list_rcvd = 0;
 
-			mptcp_v6_join_request(mpcb, skb);
+			mptcp_v6_join_request(meta_sk, skb);
 			goto discard;
 		}
 		goto reset_and_discard;
@@ -366,7 +564,7 @@ struct sock *mptcp_v6_search_req(const __be16 rport, const struct in6_addr *radd
 		    AF_INET6_FAMILY(rev_mptcp_rsk(mtreq)->rsk_ops->family) &&
 		    ipv6_addr_equal(&treq->rmt_addr, raddr) &&
 		    ipv6_addr_equal(&treq->loc_addr, laddr)) {
-			meta_sk = mpcb_meta_sk(mtreq->mpcb);
+			meta_sk = mtreq->mpcb->meta_sk;
 			break;
 		}
 	}
@@ -383,12 +581,11 @@ struct sock *mptcp_v6_search_req(const __be16 rport, const struct in6_addr *radd
  *
  * We are in user-context and meta-sock-lock is hold.
  */
-void mptcp_init6_subsockets(struct mptcp_cb *mpcb,
-			    const struct mptcp_loc6 *loc,
+void mptcp_init6_subsockets(struct sock *meta_sk, const struct mptcp_loc6 *loc,
 			    struct mptcp_rem6 *rem)
 {
 	struct tcp_sock *tp;
-	struct sock *sk, *meta_sk = mpcb_meta_sk(mpcb);
+	struct sock *sk;
 	struct sockaddr_in6 loc_in, rem_in;
 	struct socket sock;
 	int ulid_size = 0, ret, newpi;
@@ -399,7 +596,7 @@ void mptcp_init6_subsockets(struct mptcp_cb *mpcb,
 	 */
 	rem->bitfield |= (1 << (loc->id - min(loc->id, (u8)MPTCP_MAX_ADDR)));
 
-	newpi = mptcp_set_new_pathindex(mpcb);
+	newpi = mptcp_set_new_pathindex(tcp_sk(meta_sk)->mpcb);
 	if (!newpi)
 		return;
 
@@ -422,7 +619,7 @@ void mptcp_init6_subsockets(struct mptcp_cb *mpcb,
 	sk->sk_error_report = mptcp_sock_def_error_report;
 
 	tp = tcp_sk(sk);
-	if (mptcp_add_sock(mpcb, tp, GFP_KERNEL))
+	if (mptcp_add_sock(meta_sk, tp, GFP_KERNEL))
 		goto error;
 
 	tp->mptcp->rem_id = rem->id;
@@ -445,7 +642,7 @@ void mptcp_init6_subsockets(struct mptcp_cb *mpcb,
 	rem_in.sin6_addr = rem->addr;
 
 	mptcp_debug("%s: token %#x pi %d src_addr:%pI6:%d dst_addr:%pI6:%d\n",
-		    __func__, mpcb->mptcp_loc_token, newpi, &loc_in.sin6_addr,
+		    __func__, tcp_sk(meta_sk)->mpcb->mptcp_loc_token, newpi, &loc_in.sin6_addr,
 		    ntohs(loc_in.sin6_port), &rem_in.sin6_addr,
 		    ntohs(rem_in.sin6_port));
 
@@ -620,7 +817,7 @@ void mptcp_pm_addr6_event_handler(struct inet6_ifaddr *ifa, unsigned long event,
 		/* re-send addresses */
 		mptcp_v6_send_add_addr(i, mpcb);
 		/* re-evaluate paths */
-		mptcp_send_updatenotif(mpcb);
+		mptcp_send_updatenotif(mpcb->meta_sk);
 	}
 	return;
 found:
@@ -642,10 +839,6 @@ found:
 			if (new_low_prio != tp->mptcp->low_prio)
 				tp->mptcp->send_mp_prio = 1;
 			tp->mptcp->low_prio = new_low_prio;
-		} else {
-			printk(KERN_DEBUG "MPTCP_PM: NETDEV_UP %pI6, pi %d\n",
-					&ifa->addr, tp->mptcp->path_index);
-			BUG();
 		}
 	}
 
@@ -654,7 +847,7 @@ found:
 
 		/* Force sending directly the REMOVE_ADDR option */
 		mpcb->remove_addrs |= (1 << mpcb->addr6[i].id);
-		sk = mptcp_select_ack_sock(mpcb, 0);
+		sk = mptcp_select_ack_sock(mpcb->meta_sk, 0);
 		if (sk)
 			tcp_send_ack(sk);
 
@@ -688,8 +881,42 @@ static struct notifier_block mptcp_pm_v6_netdev_notifier = {
 /*
  * General initialization of IPv6 for MPTCP
  */
-void mptcp_pm_v6_init(void)
+int mptcp_pm_v6_init(void)
 {
-	register_inet6addr_notifier(&mptcp_pm_inet6_addr_notifier);
-	register_netdevice_notifier(&mptcp_pm_v6_netdev_notifier);
+	int ret;
+	struct request_sock_ops *ops = &mptcp6_request_sock_ops;
+
+	ops->slab_name = kasprintf(GFP_KERNEL, "request_sock_%s", "MPTCP6");
+	if (ops->slab_name == NULL) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ops->slab = kmem_cache_create(ops->slab_name, ops->obj_size, 0,
+				      SLAB_HWCACHE_ALIGN, NULL);
+
+	if (ops->slab == NULL) {
+		printk(KERN_CRIT "%s: Can't create request sock SLAB cache!\n", "MPTCP6");
+		ret =  -ENOMEM;
+		goto err_reqsk_create;
+	}
+
+	ret = register_inet6addr_notifier(&mptcp_pm_inet6_addr_notifier);
+	if (ret)
+		goto err_reg_inet6addr;
+	ret = register_netdevice_notifier(&mptcp_pm_v6_netdev_notifier);
+	if (ret)
+		goto err_reg_netdev6;
+
+out:
+	return ret;
+
+err_reg_netdev6:
+	unregister_inet6addr_notifier(&mptcp_pm_inet6_addr_notifier);
+err_reg_inet6addr:
+	kmem_cache_destroy(ops->slab);
+err_reqsk_create:
+	kfree(ops->slab_name);
+	ops->slab_name = NULL;
+	goto out;
 }

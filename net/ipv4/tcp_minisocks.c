@@ -429,52 +429,6 @@ static inline void TCP_ECN_openreq_child(struct tcp_sock *tp,
 	tp->ecn_flags = inet_rsk(req)->ecn_ok ? TCP_ECN_OK : 0;
 }
 
-void tcp_openreq_init(struct request_sock *req,
-		      struct tcp_options_received *rx_opt,
-		      struct multipath_options *mopt,
-		      struct sk_buff *skb)
-{
-	struct inet_request_sock *ireq = inet_rsk(req);
-
-	req->rcv_wnd = 0;		/* So that tcp_send_synack() knows! */
-	req->cookie_ts = 0;
-	tcp_rsk(req)->rcv_isn = TCP_SKB_CB(skb)->seq;
-	req->mss = rx_opt->mss_clamp;
-	req->ts_recent = rx_opt->saw_tstamp ? rx_opt->rcv_tsval : 0;
-#ifdef CONFIG_MPTCP
-	tcp_rsk(req)->saw_mpc = rx_opt->saw_mpc;
-	if (tcp_rsk(req)->saw_mpc && !mptcp_rsk(req)->mpcb) {
-		/* conn request, prepare a new token for the mpcb
-		 * that will be created in mptcp_check_req_master(),
-		 * and store the received token.
-		 */
-		struct mptcp_request_sock *mtreq;
-		mtreq = mptcp_rsk(req);
-		spin_lock(&mptcp_reqsk_tk_hlock);
-		do {
-			get_random_bytes(&mtreq->mptcp_loc_key,
-					 sizeof(mtreq->mptcp_loc_key));
-			mptcp_key_sha1(mtreq->mptcp_loc_key,
-				       &mtreq->mptcp_loc_token, NULL);
-		} while (mptcp_reqsk_find_tk(mtreq->mptcp_loc_token) ||
-			 mptcp_find_token(mtreq->mptcp_loc_token));
-
-		mptcp_reqsk_insert_tk(req, mtreq->mptcp_loc_token);
-		spin_unlock(&mptcp_reqsk_tk_hlock);
-		mtreq->mptcp_rem_key = mopt->mptcp_rem_key;
-	}
-#endif
-	ireq->tstamp_ok = rx_opt->tstamp_ok;
-	ireq->sack_ok = rx_opt->sack_ok;
-	ireq->snd_wscale = rx_opt->snd_wscale;
-	ireq->wscale_ok = rx_opt->wscale_ok;
-	ireq->acked = 0;
-	ireq->ecn_ok = 0;
-	ireq->rmt_port = tcp_hdr(skb)->source;
-	ireq->loc_port = tcp_hdr(skb)->dest;
-}
-EXPORT_SYMBOL(tcp_openreq_init);
-
 /* This is not only more efficient than what we used to do, it eliminates
  * a lot of code duplication between IPv4/IPv6 SYN recv processing. -DaveM
  *
@@ -813,11 +767,10 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	 * ESTABLISHED STATE. If it will be dropped after
 	 * socket is created, wait for troubles.
 	 */
-#if defined(CONFIG_MPTCP) && defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
-	if (tcp_sk(sk)->mpc && sk->sk_family != req->rsk_ops->family)
-		/* MPTCP: sub sock address family differs from meta sock */
-		child = tcp_sk(sk)->mpcb->icsk_af_ops_alt->syn_recv_sock(sk,
-				skb, req, NULL);
+#if defined(CONFIG_MPTCP)
+	if (tcp_sk(sk)->mpc)
+		/* MPTCP: We call the mptcp-specific syn_recv_sock */
+		child = tcp_sk(sk)->mpcb->syn_recv_sock(sk, skb, req, NULL);
 	else
 #endif
 		child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb,
@@ -833,9 +786,9 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 
 		/* MPTCP-supported */
 		if (!ret)
-			return child;
+			return tcp_sk(child)->mpcb->master_sk;
 	} else {
-		return mptcp_check_req_child(sk, child, req, prev);
+		return mptcp_check_req_child(sk, child, req, prev, &tmp_opt);
 	}
 	inet_csk_reqsk_queue_unlink(sk, req, prev);
 	inet_csk_reqsk_queue_removed(sk, req);
@@ -876,8 +829,7 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 		ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb),
 					    skb->len);
 		/* Wakeup parent, send SIGIO */
-		if (state == TCP_SYN_RECV && child->sk_state != state &&
-		    !tcp_sk(parent)->mpc)
+		if (state == TCP_SYN_RECV && child->sk_state != state)
 			parent->sk_data_ready(parent, 0);
 	} else {
 		/* Alas, it is possible again, because we do lookup
@@ -889,11 +841,7 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 		__sk_add_backlog(meta_sk, skb);
 	}
 
-	if (tcp_sk(child)->mpc && is_master_tp(tcp_sk(child)))
-		 /* Taken by mptcp_inherit_sk or tcp_vX_hnd_req */
-		bh_unlock_sock(meta_sk);
-
-	bh_unlock_sock(child);
+	bh_unlock_sock(meta_sk);
 	sock_put(child);
 	return ret;
 }
