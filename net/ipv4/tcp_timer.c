@@ -44,7 +44,7 @@ void tcp_init_xmit_timers(struct sock *sk)
 }
 EXPORT_SYMBOL(tcp_init_xmit_timers);
 
-static void tcp_write_err(struct sock *sk)
+void tcp_write_err(struct sock *sk)
 {
 	sk->sk_err = sk->sk_err_soft ? : ETIMEDOUT;
 	sk->sk_error_report(sk);
@@ -68,7 +68,6 @@ static int tcp_out_of_resources(struct sock *sk, int do_reset)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int shift = 0;
-	u32 snd_wnd = tp->mpc ? mptcp_meta_tp(tp)->snd_wnd : tp->snd_wnd;
 
 	/* If peer does not open window for long time, or did not transmit
 	 * anything for long time, penalize it. */
@@ -87,7 +86,7 @@ static int tcp_out_of_resources(struct sock *sk, int do_reset)
 		 *      1. Last segment was sent recently. */
 		if ((s32)(tcp_time_stamp - tp->lsndtime) <= TCP_TIMEWAIT_LEN ||
 		    /*  2. Window is closed. */
-		    (!snd_wnd && !tp->packets_out))
+		    (!tp->snd_wnd && !tp->packets_out))
 			do_reset = 1;
 		if (do_reset)
 			tcp_send_active_reset(sk, GFP_ATOMIC);
@@ -140,10 +139,8 @@ static void tcp_mtu_probing(struct inet_connection_sock *icsk, struct sock *sk)
  * retransmissions with an initial RTO of TCP_RTO_MIN or TCP_TIMEOUT_INIT if
  * syn_set flag is set.
  */
-static bool retransmits_timed_out(struct sock *sk,
-				  unsigned int boundary,
-				  unsigned int timeout,
-				  bool syn_set)
+bool retransmits_timed_out(struct sock *sk, unsigned int boundary,
+			   unsigned int timeout, bool syn_set)
 {
 	unsigned int linear_backoff_thresh, start_ts;
 	unsigned int rto_base = syn_set ? TCP_TIMEOUT_INIT : TCP_RTO_MIN;
@@ -169,7 +166,7 @@ static bool retransmits_timed_out(struct sock *sk,
 }
 
 /* A write timeout has occurred. Process the after effects. */
-static int tcp_write_timeout(struct sock *sk)
+int tcp_write_timeout(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	int retry_until;
@@ -281,9 +278,7 @@ static void tcp_probe_timer(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	int max_probes;
 
-	 if (tp->packets_out || (!tp->mpc && !tcp_send_head(sk)) ||
-			(tp->mpc && !tcp_send_head(sk) &&
-			!tcp_send_head(mptcp_meta_sk(sk)))) {
+	if (tp->packets_out || !tcp_send_head(sk)) {
 		icsk->icsk_probes_out = 0;
 		return;
 	}
@@ -330,14 +325,13 @@ void tcp_retransmit_timer(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct inet_connection_sock *icsk = inet_csk(sk);
-	u32 snd_wnd = tp->mpc ? mptcp_meta_tp(tp)->snd_wnd : tp->snd_wnd;
 
 	if (!tp->packets_out)
 		goto out;
 
 	WARN_ON(tcp_write_queue_empty(sk));
 
-	if (!snd_wnd && !sock_flag(sk, SOCK_DEAD) &&
+	if (!tp->snd_wnd && !sock_flag(sk, SOCK_DEAD) &&
 	    !((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV))) {
 		/* Receiver dastardly shrinks window. Our retransmits
 		 * become zero probes, but we should not timeout this
@@ -401,6 +395,9 @@ void tcp_retransmit_timer(struct sock *sk)
 		tcp_enter_loss(sk, 0);
 	}
 
+	if (tp->mpc)
+		mptcp_reinject_data(sk, 1);
+
 	if (tcp_retransmit_skb(sk, tcp_write_queue_head(sk)) > 0) {
 		/* Retransmission failed because of local congestion,
 		 * do not backoff.
@@ -462,8 +459,7 @@ out:;
 static void tcp_write_timer(unsigned long data)
 {
 	struct sock *sk = (struct sock *)data;
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct sock *meta_sk = tp->mpc ? mptcp_meta_sk(sk) : sk;
+	struct sock *meta_sk = tcp_sk(sk)->mpc ? mptcp_meta_sk(sk) : sk;
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	int event;
 
@@ -537,11 +533,12 @@ static void tcp_keepalive_timer (unsigned long data)
 	struct sock *sk = (struct sock *) data;
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	struct sock *meta_sk = tp->mpc ? mptcp_meta_sk(sk) : sk;
 	u32 elapsed;
 
 	/* Only process if socket is not in use. */
-	bh_lock_sock(sk);
-	if (sock_owned_by_user(sk)) {
+	bh_lock_sock(meta_sk);
+	if (sock_owned_by_user(meta_sk)) {
 		/* Try again later. */
 		inet_csk_reset_keepalive_timer (sk, HZ/20);
 		goto out;
@@ -615,6 +612,6 @@ death:
 	tcp_done(sk);
 
 out:
-	bh_unlock_sock(sk);
+	bh_unlock_sock(meta_sk);
 	sock_put(sk);
 }

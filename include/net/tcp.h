@@ -365,6 +365,14 @@ extern void tcp_reset(struct sock *sk);
 extern int tcp_may_update_window(const struct tcp_sock *tp, const u32 ack,
 				 const u32 ack_seq, const u32 nwin);
 extern int tcp_urg_mode(const struct tcp_sock *tp);
+extern void tcp_ack_probe(struct sock *sk);
+extern void tcp_rearm_rto(struct sock *sk);
+extern int tcp_write_timeout(struct sock *sk);
+extern bool retransmits_timed_out(struct sock *sk, unsigned int boundary,
+				  unsigned int timeout, bool syn_set);
+extern void tcp_write_err(struct sock *sk);
+extern void tcp_adjust_pcount(struct sock *sk, const struct sk_buff *skb, int decr);
+
 
 extern int tcp_v4_rtx_synack(struct sock *sk, struct request_sock *req,
 			     struct request_values *rvp);
@@ -1047,6 +1055,7 @@ static inline int tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 	return 1;
 }
 
+
 #undef STATE_TRACE
 
 #ifdef STATE_TRACE
@@ -1070,7 +1079,7 @@ static inline void tcp_sack_reset(struct tcp_options_received *rx_opt)
 extern void tcp_select_initial_window(int __space, __u32 mss,
 				      __u32 *rcv_wnd, __u32 *window_clamp,
 				      int wscale_ok, __u8 *rcv_wscale,
-				      __u32 init_rcv_wnd);
+				      __u32 init_rcv_wnd, const struct sock *sk);
 
 static inline int tcp_win_from_space(int space)
 {
@@ -1433,7 +1442,14 @@ static inline int tcp_write_queue_empty(struct sock *sk)
 	return skb_queue_empty(&sk->sk_write_queue);
 }
 
-extern void tcp_push_pending_frames(struct sock *sk);
+static inline void tcp_push_pending_frames(struct sock *sk)
+{
+	if (tcp_send_head(sk)) {
+		struct tcp_sock *tp = tcp_sk(sk);
+
+		__tcp_push_pending_frames(sk, tcp_current_mss(sk), tp->nonagle);
+	}
+}
 
 /* Start sequence of the highest skb with SACKed bit, valid only if
  * sacked > 0 or when the caller has ensured validity by itself.

@@ -85,7 +85,7 @@ static void mptcp_v6_reqsk_queue_hash_add(struct request_sock *req,
 }
 
 /* The meta-socket is IPv4, but a new subsocket is IPv6 */
-static int mptcp_v6v4_send_synack(struct sock *sk, struct request_sock *req,
+static int mptcp_v6v4_send_synack(struct sock *meta_sk, struct request_sock *req,
 				  struct request_values *rvp)
 {
 	struct inet6_request_sock *treq = inet6_rsk(req);
@@ -100,24 +100,24 @@ static int mptcp_v6v4_send_synack(struct sock *sk, struct request_sock *req,
 	ipv6_addr_copy(&fl6.saddr, &treq->loc_addr);
 	fl6.flowlabel = 0;
 	fl6.flowi6_oif = treq->iif;
-	fl6.flowi6_mark = sk->sk_mark;
+	fl6.flowi6_mark = meta_sk->sk_mark;
 	fl6.fl6_dport = inet_rsk(req)->rmt_port;
 	fl6.fl6_sport = inet_rsk(req)->loc_port;
 	security_req_classify_flow(req, flowi6_to_flowi(&fl6));
 
-	dst = ip6_dst_lookup_flow(sk, &fl6, NULL, false);
+	dst = ip6_dst_lookup_flow(meta_sk, &fl6, NULL, false);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		dst = NULL;
 		goto done;
 	}
-	skb = tcp_make_synack(sk, dst, req, rvp);
+	skb = tcp_make_synack(meta_sk, dst, req, rvp);
 	err = -ENOMEM;
 	if (skb) {
 		__tcp_v6_send_check(skb, &treq->loc_addr, &treq->rmt_addr);
 
 		ipv6_addr_copy(&fl6.daddr, &treq->rmt_addr);
-		err = ip6_xmit(sk, skb, &fl6, NULL);
+		err = ip6_xmit(meta_sk, skb, &fl6, NULL);
 		err = net_xmit_eval(err);
 	}
 
@@ -269,7 +269,7 @@ static void mptcp_v6_join_request_short(struct sock *meta_sk,
 	mtreq = mptcp_rsk(req);
 	mtreq->mpcb = mpcb;
 	mtreq->mptcp_rem_nonce = tmp_opt->mptcp_recv_nonce;
-	mtreq->mptcp_rem_key = mpcb->rx_opt.mptcp_rem_key;
+	mtreq->mptcp_rem_key = mpcb->mptcp_rem_key;
 	mtreq->mptcp_loc_key = mpcb->mptcp_loc_key;
 
 	get_random_bytes(&mtreq->mptcp_loc_nonce,
@@ -384,7 +384,7 @@ int mptcp_v6_add_raddress(struct multipath_options *mopt,
 		 * However the src_addr of the IP-packet has been changed. We
 		 * update the addr in the list, because this is the address as
 		 * OUR BOX sees it. */
-		if (rem6->id == id && !ipv6_addr_equal(&rem6->addr, addr)) {
+		if (rem6->id == id) {
 			/* update the address */
 			mptcp_debug("%s: updating old addr: %pI6 \
 					to addr %pI6 with id:%d\n",
@@ -479,6 +479,7 @@ int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)) {
 		struct tcphdr *th = tcp_hdr(skb);
 		struct sock *sk;
+		int ret;
 
 		sk = __inet6_lookup_established(sock_net(meta_sk), &tcp_hashinfo,
 				&ipv6_hdr(skb)->saddr, th->source,
@@ -493,7 +494,15 @@ int mptcp_v6_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 			return 0;
 		}
 
-		return tcp_v6_do_rcv(sk, skb);
+		if (sk->sk_state == TCP_TIME_WAIT) {
+			inet_twsk_put(inet_twsk(sk));
+			return 0;
+		}
+
+		ret = tcp_v6_do_rcv(sk, skb);
+		sock_put(sk);
+
+		return ret;
 	}
 	TCP_SKB_CB(skb)->mptcp_flags = 0;
 
@@ -588,17 +597,13 @@ void mptcp_init6_subsockets(struct sock *meta_sk, const struct mptcp_loc6 *loc,
 	struct sock *sk;
 	struct sockaddr_in6 loc_in, rem_in;
 	struct socket sock;
-	int ulid_size = 0, ret, newpi;
+	int ulid_size = 0, ret;
 
 	/* Don't try again - even if it fails.
 	 * There is a special case as the IPv6 address of the initial subflow
 	 * has an id = 0. The other ones have id's in the range [8, 16[.
 	 */
 	rem->bitfield |= (1 << (loc->id - min(loc->id, (u8)MPTCP_MAX_ADDR)));
-
-	newpi = mptcp_set_new_pathindex(tcp_sk(meta_sk)->mpcb);
-	if (!newpi)
-		return;
 
 	/** First, create and prepare the new socket */
 
@@ -609,24 +614,22 @@ void mptcp_init6_subsockets(struct sock *meta_sk, const struct mptcp_loc6 *loc,
 	sock.ops = NULL;
 
 	ret = inet6_create(sock_net(meta_sk), &sock, IPPROTO_TCP, 1);
-
 	if (unlikely(ret < 0)) {
 		mptcp_debug("%s inet6_create failed ret: %d\n", __func__, ret);
 		return;
 	}
 
 	sk = sock.sk;
-	sk->sk_error_report = mptcp_sock_def_error_report;
-
 	tp = tcp_sk(sk);
-	if (mptcp_add_sock(meta_sk, tp, GFP_KERNEL))
+
+	if (mptcp_add_sock(meta_sk, sk, rem->id, GFP_KERNEL))
 		goto error;
 
-	tp->mptcp->rem_id = rem->id;
-	tp->mptcp->path_index = newpi;
-	tp->mpc = 1;
 	tp->mptcp->slave_sk = 1;
 	tp->mptcp->low_prio = loc->low_prio;
+
+	/* Initializing the timer for an MPTCP subflow */
+	mptcp_init_ack_timer(sk);
 
 	/** Then, connect the socket to the peer */
 
@@ -642,8 +645,8 @@ void mptcp_init6_subsockets(struct sock *meta_sk, const struct mptcp_loc6 *loc,
 	rem_in.sin6_addr = rem->addr;
 
 	mptcp_debug("%s: token %#x pi %d src_addr:%pI6:%d dst_addr:%pI6:%d\n",
-		    __func__, tcp_sk(meta_sk)->mpcb->mptcp_loc_token, newpi, &loc_in.sin6_addr,
-		    ntohs(loc_in.sin6_port), &rem_in.sin6_addr,
+		    __func__, tcp_sk(meta_sk)->mpcb->mptcp_loc_token, tp->mptcp->path_index,
+		    &loc_in.sin6_addr, ntohs(loc_in.sin6_port), &rem_in.sin6_addr,
 		    ntohs(rem_in.sin6_port));
 
 	ret = sock.ops->bind(&sock, (struct sockaddr *)&loc_in, ulid_size);
@@ -782,7 +785,7 @@ void mptcp_pm_addr6_event_handler(struct inet6_ifaddr *ifa, unsigned long event,
 				  struct mptcp_cb *mpcb)
 {
 	int i;
-	struct sock *sk;
+	struct sock *sk, *tmpsk;
 	int addr_type = ipv6_addr_type(&ifa->addr);
 
 	/* Checks on interface and address-type */
@@ -823,15 +826,14 @@ void mptcp_pm_addr6_event_handler(struct inet6_ifaddr *ifa, unsigned long event,
 found:
 	/* Address already in list. Reactivate/Deactivate the
 	 * concerned paths. */
-	mptcp_for_each_sk(mpcb, sk) {
+	mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
 		struct tcp_sock *tp = tcp_sk(sk);
 		if (sk->sk_family != AF_INET6 ||
 		    !ipv6_addr_equal(&inet6_sk(sk)->saddr, &ifa->addr))
 			continue;
 
 		if (event == NETDEV_DOWN) {
-			mptcp_retransmit_queue(sk);
-
+			mptcp_reinject_data(sk, 1);
 			mptcp_sub_force_close(sk);
 		} else if (event == NETDEV_CHANGE) {
 			int new_low_prio = (ifa->idev->dev->flags & IFF_MPBACKUP) ?

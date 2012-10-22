@@ -103,7 +103,7 @@ static void mptcp_v4_join_request_short(struct sock *meta_sk,
 	mtreq = mptcp_rsk(req);
 	mtreq->mpcb = mpcb;
 	mtreq->mptcp_rem_nonce = tmp_opt->mptcp_recv_nonce;
-	mtreq->mptcp_rem_key = mpcb->rx_opt.mptcp_rem_key;
+	mtreq->mptcp_rem_key = mpcb->mptcp_rem_key;
 	mtreq->mptcp_loc_key = mpcb->mptcp_loc_key;
 
 	get_random_bytes(&mtreq->mptcp_loc_nonce,
@@ -307,6 +307,7 @@ int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 		struct tcphdr *th = tcp_hdr(skb);
 		const struct iphdr *iph = ip_hdr(skb);
 		struct sock *sk;
+		int ret;
 
 		sk = inet_lookup_established(sock_net(meta_sk), &tcp_hashinfo,
 					     iph->saddr, th->source, iph->daddr,
@@ -321,7 +322,15 @@ int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 			return 0;
 		}
 
-		return tcp_v4_do_rcv(sk, skb);
+		if (sk->sk_state == TCP_TIME_WAIT) {
+			inet_twsk_put(inet_twsk(sk));
+			return 0;
+		}
+
+		ret = tcp_v4_do_rcv(sk, skb);
+		sock_put(sk);
+
+		return ret;
 	}
 	TCP_SKB_CB(skb)->mptcp_flags = 0;
 
@@ -416,14 +425,10 @@ void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	struct sock *sk;
 	struct sockaddr_in loc_in, rem_in;
 	struct socket sock;
-	int ulid_size = 0, ret, newpi;
+	int ulid_size = 0, ret;
 
 	/* Don't try again - even if it fails */
 	rem->bitfield |= (1 << loc->id);
-
-	newpi = mptcp_set_new_pathindex(tcp_sk(meta_sk)->mpcb);
-	if (!newpi)
-		return;
 
 	/** First, create and prepare the new socket */
 
@@ -440,17 +445,16 @@ void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	}
 
 	sk = sock.sk;
-	sk->sk_error_report = mptcp_sock_def_error_report;
-
 	tp = tcp_sk(sk);
-	if (mptcp_add_sock(meta_sk, tp, GFP_KERNEL))
+
+	if (mptcp_add_sock(meta_sk, sk, rem->id, GFP_KERNEL))
 		goto error;
 
-	tp->mptcp->rem_id = rem->id;
-	tp->mptcp->path_index = newpi;
-	tp->mpc = 1;
 	tp->mptcp->slave_sk = 1;
 	tp->mptcp->low_prio = loc->low_prio;
+
+	/* Initializing the timer for an MPTCP subflow */
+	mptcp_init_ack_timer(sk);
 
 	/** Then, connect the socket to the peer */
 
@@ -466,8 +470,8 @@ void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	rem_in.sin_addr = rem->addr;
 
 	mptcp_debug("%s: token %#x pi %d src_addr:%pI4:%d dst_addr:%pI4:%d\n",
-		    __func__, tcp_sk(meta_sk)->mpcb->mptcp_loc_token, newpi, &loc_in.sin_addr,
-		    ntohs(loc_in.sin_port), &rem_in.sin_addr,
+		    __func__, tcp_sk(meta_sk)->mpcb->mptcp_loc_token, tp->mptcp->path_index,
+		    &loc_in.sin_addr, ntohs(loc_in.sin_port), &rem_in.sin_addr,
 		    ntohs(rem_in.sin_port));
 
 	ret = sock.ops->bind(&sock, (struct sockaddr *)&loc_in, ulid_size);
@@ -550,7 +554,7 @@ void mptcp_pm_addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 				  struct mptcp_cb *mpcb)
 {
 	int i;
-	struct sock *sk;
+	struct sock *sk, *tmpsk;
 
 	if (ifa->ifa_scope > RT_SCOPE_LINK ||
 	    (ifa->ifa_dev->dev->flags & IFF_NOMULTIPATH))
@@ -586,15 +590,14 @@ void mptcp_pm_addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 found:
 	/* Address already in list. Reactivate/Deactivate the
 	 * concerned paths. */
-	mptcp_for_each_sk(mpcb, sk) {
+	mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
 		struct tcp_sock *tp = tcp_sk(sk);
 		if (sk->sk_family != AF_INET ||
 		    inet_sk(sk)->inet_saddr != ifa->ifa_local)
 			continue;
 
 		if (event == NETDEV_DOWN) {
-			mptcp_retransmit_queue(sk);
-
+			mptcp_reinject_data(sk, 1);
 			mptcp_sub_force_close(sk);
 		} else if (event == NETDEV_CHANGE) {
 			int new_low_prio = (ifa->ifa_dev->dev->flags & IFF_MPBACKUP) ?

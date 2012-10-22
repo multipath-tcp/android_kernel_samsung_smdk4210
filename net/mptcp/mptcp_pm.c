@@ -643,7 +643,7 @@ void mptcp_send_updatenotif(struct sock *meta_sk)
 void mptcp_address_worker(struct work_struct *work)
 {
 	struct mptcp_cb *mpcb = container_of(work, struct mptcp_cb, address_work);
-	struct sock *meta_sk = mpcb->meta_sk, *sk;
+	struct sock *meta_sk = mpcb->meta_sk, *sk, *tmpsk;
 	struct net *netns = sock_net(meta_sk);
 	struct net_device *dev;
 	int i;
@@ -744,13 +744,12 @@ cont_ipv6:
 		 */
 
 		/* Look for the socket and remove him */
-		mptcp_for_each_sk(mpcb, sk) {
+		mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
 			if (sk->sk_family != AF_INET ||
 			    inet_sk(sk)->inet_saddr != mpcb->addr4[i].addr.s_addr)
 				continue;
 
-			mptcp_retransmit_queue(sk);
-
+			mptcp_reinject_data(sk, 1);
 			mptcp_sub_force_close(sk);
 		}
 
@@ -795,13 +794,12 @@ next_loc_addr:
 		 */
 
 		/* Look for the socket and remove him */
-		mptcp_for_each_sk(mpcb, sk) {
+		mptcp_for_each_sk_safe(mpcb, sk, tmpsk) {
 			if (sk->sk_family != AF_INET6 ||
 			    !ipv6_addr_equal(&inet6_sk(sk)->saddr, &mpcb->addr6[i].addr))
 				continue;
 
-			mptcp_retransmit_queue(sk);
-
+			mptcp_reinject_data(sk, 1);
 			mptcp_sub_force_close(sk);
 		}
 
@@ -920,10 +918,10 @@ static int mptcp_pm_seq_show(struct seq_file *seq, void *v)
 						&isk->pinet6->daddr, ntohs(isk->inet_dport));
 #endif
 			}
-			seq_printf(seq, "Loc_Tok %#x Rem_tok %#x cnt_est %d meta-state %d infinite? %d",
+			seq_printf(seq, "Loc_Tok %#x Rem_tok %#x cnt_subs %d meta-state %d infinite? %d",
 					mpcb->mptcp_loc_token,
-					mpcb->rx_opt.mptcp_rem_token,
-					mpcb->cnt_established,
+					mpcb->mptcp_rem_token,
+					mpcb->cnt_subflows,
 					meta_sk->sk_state,
 					mpcb->infinite_mapping);
 			seq_putc(seq, '\n');

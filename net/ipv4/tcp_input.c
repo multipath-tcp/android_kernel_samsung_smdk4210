@@ -90,17 +90,7 @@ EXPORT_SYMBOL(sysctl_tcp_adv_win_scale);
 int sysctl_tcp_stdurg __read_mostly;
 int sysctl_tcp_rfc1337 __read_mostly;
 int sysctl_tcp_max_orphans __read_mostly = NR_FILE;
-#ifdef CONFIG_MPTCP
-/* At the moment we disable frto, because it creates problems
- * with failure recovery: It waits for the next ack before to decide
- * whether it enters the Loss state. But in case of failure,
- * the next ack never arrives of course. When we have several paths this is
- * a problem because we do want to retransmit on another working subflow
- * in that case. */
-int sysctl_tcp_frto __read_mostly = 0;
-#else
 int sysctl_tcp_frto __read_mostly = 2;
-#endif
 int sysctl_tcp_frto_response __read_mostly;
 int sysctl_tcp_nometrics_save __read_mostly;
 
@@ -2193,7 +2183,6 @@ static void tcp_enter_frto_loss(struct sock *sk, int allowed_segments, int flag)
 	tp->reordering = min_t(unsigned int, tp->reordering,
 			       sysctl_tcp_reordering);
 	tcp_set_ca_state(sk, TCP_CA_Loss);
-	mptcp_retransmit_queue(sk);
 	tp->high_seq = tp->snd_nxt;
 	TCP_ECN_queue_cwr(tp);
 
@@ -2273,7 +2262,6 @@ void tcp_enter_loss(struct sock *sk, int how)
 	tp->reordering = min_t(unsigned int, tp->reordering,
 			       sysctl_tcp_reordering);
 	tcp_set_ca_state(sk, TCP_CA_Loss);
-	mptcp_retransmit_queue(sk);
 	tp->high_seq = tp->snd_nxt;
 	TCP_ECN_queue_cwr(tp);
 	/* Abort F-RTO algorithm if one is in progress */
@@ -2962,7 +2950,6 @@ void tcp_simple_retransmit(struct sock *sk)
 		tp->prior_ssthresh = 0;
 		tp->undo_marker = 0;
 		tcp_set_ca_state(sk, TCP_CA_Loss);
-		mptcp_retransmit_queue(sk);
 	}
 	tcp_xmit_retransmit_queue(sk);
 }
@@ -3209,7 +3196,7 @@ static void tcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
 /* Restart timer after forward progress on connection.
  * RFC2988 recommends to restart timer to now+rto.
  */
-static void tcp_rearm_rto(struct sock *sk)
+void tcp_rearm_rto(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -3418,7 +3405,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 	return flag;
 }
 
-static void tcp_ack_probe(struct sock *sk)
+void tcp_ack_probe(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -3503,8 +3490,6 @@ static int tcp_ack_update_window(struct sock *sk, struct sk_buff *skb, u32 ack,
 
 no_window_update:
 	tp->snd_una = ack;
-	if (tp->mpc && after(tp->snd_una, tp->mptcp->reinjected_seq))
-		tp->mptcp->reinjected_seq = tp->snd_una;
 
 	return flag;
 }
@@ -4134,7 +4119,7 @@ void tcp_reset(struct sock *sk)
  *
  *	If we are in FINWAIT-2, a received FIN moves us to TIME-WAIT.
  */
-static void tcp_fin(struct sk_buff *skb, struct sock *sk, struct tcphdr *th)
+static void tcp_fin(struct sock *sk, const struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -4172,6 +4157,13 @@ static void tcp_fin(struct sk_buff *skb, struct sock *sk, struct tcphdr *th)
 		tcp_set_state(sk, TCP_CLOSING);
 		break;
 	case TCP_FIN_WAIT2:
+		if (tp->mpc) {
+			/* The socket will get closed by mptcp_data_ready.
+			 * We first have to process all data-sequences.
+			 */
+			tp->close_it = 1;
+			break;
+		}
 		/* Received a FIN -- send ACK and enter TIME_WAIT. */
 		tcp_send_ack(sk);
 		tcp_time_wait(sk, TCP_TIME_WAIT, 0);
@@ -4193,9 +4185,12 @@ static void tcp_fin(struct sk_buff *skb, struct sock *sk, struct tcphdr *th)
 		tcp_sack_reset(&tp->rx_opt);
 	sk_mem_reclaim(sk);
 
-	/* MPTCP: subflow-fin has no effect to the application */
-	if (!tp->mpc && !sock_flag(sk, SOCK_DEAD)) {
+	if (!sock_flag(sk, SOCK_DEAD)) {
 		sk->sk_state_change(sk);
+
+		/* Don't wake up MPTCP-subflows */
+		if (tp->mpc)
+			return;
 
 		/* Do not send POLL_HUP for half duplex close. */
 		if (sk->sk_shutdown == SHUTDOWN_MASK ||
@@ -4382,7 +4377,6 @@ static void tcp_ofo_queue(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	__u32 dsack_high = tp->rcv_nxt;
 	struct sk_buff *skb;
-	int eaten = 0;
 
 	while ((skb = skb_peek(&tp->out_of_order_queue)) != NULL) {
 		if (after(TCP_SKB_CB(skb)->seq, tp->rcv_nxt))
@@ -4410,28 +4404,10 @@ static void tcp_ofo_queue(struct sock *sk)
 			   TCP_SKB_CB(skb)->end_seq);
 
 		__skb_unlink(skb, &tp->out_of_order_queue);
-
-		if (tp->mpc) {
-			eaten = mptcp_queue_skb(sk, skb);
-			if (eaten == -1)
-				return;
-			if (eaten == -2) {
-				struct sock *meta_sk = mptcp_meta_sk(sk);
-				if (!sock_flag(meta_sk, SOCK_DEAD))
-					meta_sk->sk_data_ready(meta_sk, 0);
-			}
-		} else {
-			__skb_queue_tail(&sk->sk_receive_queue, skb);
-		}
-
-		if (!tp->mpc)
-			tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
-
+		__skb_queue_tail(&sk->sk_receive_queue, skb);
+		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
 		if (tcp_hdr(skb)->fin)
-			tcp_fin(skb, sk, tcp_hdr(skb));
-		if (eaten > 0)
-			__kfree_skb(skb);
-
+			tcp_fin(sk, skb);
 	}
 }
 
@@ -4472,10 +4448,7 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	    !(tp->mpc && mptcp_is_data_fin(skb)))
 		goto drop;
 
-	/* If mptcp, we need dst for sending the reset in mptcp_queue_skb */
-	if (!tp->mpc)
-		skb_dst_drop(skb);
-
+	skb_dst_drop(skb);
 	__skb_pull(skb, th->doff * 4);
 
 	TCP_ECN_accept_cwr(tp, skb);
@@ -4515,23 +4488,14 @@ queue_and_out:
 			    tcp_try_rmem_schedule(sk, skb->truesize))
 				goto drop;
 
-			if (tp->mpc) {
-				eaten = mptcp_queue_skb(sk, skb);
-				/* Subflow is being destroyed */
-				if (eaten == -1)
-					return;
-			} else {
-				skb_set_owner_r(skb, sk);
-				__skb_queue_tail(&sk->sk_receive_queue, skb);
-			}
+			skb_set_owner_r(skb, sk);
+			__skb_queue_tail(&sk->sk_receive_queue, skb);
 		}
-		if (!tp->mpc)
-			tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
-
-		if (skb->len)
+		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+		if (skb->len || mptcp_is_data_fin(skb))
 			tcp_event_data_recv(sk, skb);
 		if (th->fin)
-			tcp_fin(skb, sk, th);
+			tcp_fin(sk, skb);
 
 		if (!skb_queue_empty(&tp->out_of_order_queue)) {
 			tcp_ofo_queue(sk);
@@ -4550,15 +4514,12 @@ queue_and_out:
 
 		if (eaten > 0)
 			__kfree_skb(skb);
-		else if (!sock_flag(sk, SOCK_DEAD) && !tp->mpc)
+		else if (!sock_flag(sk, SOCK_DEAD) || tp->mpc)
+			/* MPTCP: we always have to call data_ready, because
+			 * we may be about to receive a data-fin, which still
+			 * must get queued.
+			 */
 			sk->sk_data_ready(sk, 0);
-
-		if (tp->mpc && eaten == -2) {
-			struct sock *meta_sk = mptcp_meta_sk(sk);
-			if (!sock_flag(meta_sk, SOCK_DEAD))
-				meta_sk->sk_data_ready(meta_sk, 0);
-		}
-
 		return;
 	}
 
@@ -4973,11 +4934,9 @@ static int tcp_prune_queue(struct sock *sk)
 void tcp_cwnd_application_limited(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	struct sock *meta_sk = tp->mpc ? mptcp_meta_sk(sk) : sk;
 
 	if (inet_csk(sk)->icsk_ca_state == TCP_CA_Open &&
-	    meta_sk->sk_socket && !test_bit(SOCK_NOSPACE,
-					    &meta_sk->sk_socket->flags)) {
+	    sk->sk_socket && !test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
 		/* Limited by application or receiver window. */
 		u32 init_win = tcp_init_cwnd(tp, __sk_dst_get(sk));
 		u32 win_used = max(tp->snd_cwnd_used, init_win);
@@ -5042,7 +5001,7 @@ static int tcp_should_expand_sndbuf(struct sock *sk)
 		}
 
 		/* Backup-flow is available for sending - update send-buffer */
-		if (cnt_backups == tp->mpcb->cnt_established && backup_available)
+		if (cnt_backups == tp->mpcb->cnt_subflows && backup_available)
 			return 1;
 		return 0;
 	}
@@ -5089,26 +5048,23 @@ static void tcp_new_space(struct sock *sk)
 		tp->snd_cwnd_stamp = tcp_time_stamp;
 	}
 
-	meta_sk->sk_write_space(meta_sk);
+	sk->sk_write_space(sk);
 }
 
 static void tcp_check_space(struct sock *sk)
 {
-	struct sock *meta_sk = tcp_sk(sk)->mpc ? mptcp_meta_sk(sk) : sk;
-
-	if (sock_flag(meta_sk, SOCK_QUEUE_SHRUNK)) {
-		sock_reset_flag(meta_sk, SOCK_QUEUE_SHRUNK);
-		if (meta_sk->sk_socket &&
-			test_bit(SOCK_NOSPACE, &meta_sk->sk_socket->flags))
+	if (sock_flag(sk, SOCK_QUEUE_SHRUNK)) {
+		sock_reset_flag(sk, SOCK_QUEUE_SHRUNK);
+		if (tcp_sk(sk)->mpc ||
+		    (sk->sk_socket &&
+			test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)))
 			tcp_new_space(sk);
 	}
 }
 
 static inline void tcp_data_snd_check(struct sock *sk)
 {
-	struct sock *meta_sk = tcp_sk(sk)->mpc ? mptcp_meta_sk(sk) : sk;
-
-	tcp_push_pending_frames(meta_sk);
+	tcp_push_pending_frames(sk);
 	tcp_check_space(sk);
 }
 
@@ -5404,7 +5360,8 @@ static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 		mptcp_post_parse_options(tp, skb);
 
 		mptcp_path_array_check(mptcp_meta_sk(sk));
-		if (mptcp_mp_fail_rcvd(sk, th))
+		/* Socket may have been mp_killed by a REMOVE_ADDR */
+		if (tp->mp_killed || mptcp_mp_fail_rcvd(sk, th))
 			goto discard;
 	}
 
@@ -5719,7 +5676,7 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		if (!is_master_tp(tp)) {
 			u8 hash_mac_check[20];
 
-			mptcp_hmac_sha1((u8 *)&mpcb->rx_opt.mptcp_rem_key,
+			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
 					(u8 *)&mpcb->mptcp_loc_key,
 					(u8 *)&tp->rx_opt.mptcp_recv_nonce,
 					(u8 *)&tp->mptcp->mptcp_loc_nonce,
@@ -5730,6 +5687,11 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 				tp->mptcp->teardown = 1;
 				goto reset_and_undo;
 			}
+
+			/* Set this flag in order to postpone data sending
+			 * until the 4th ack arrives.
+			 */
+			tp->mptcp->pre_established = 1;
 		} else if (tp->rx_opt.saw_mpc && tp->request_mptcp) {
 			if (mptcp_create_master_sk(sk, mopt.mptcp_rem_key,
 						   ntohs(th->window)))
@@ -5742,7 +5704,6 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 			 * by tcp_connect for the SYN
 			 */
 			tp->mptcp->snt_isn = tp->snd_nxt - 1;
-			tp->mptcp->reinjected_seq = tp->snd_nxt - 1;
 
 			mpcb = tp->mpcb;
 
@@ -5785,7 +5746,17 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		 * move to established.
 		 */
 #ifdef CONFIG_MPTCP
-		tp->rx_opt.rcv_isn = TCP_SKB_CB(skb)->seq;
+		if (tp->mpc) {
+			tp->rx_opt.rcv_isn = TCP_SKB_CB(skb)->seq;
+
+			if (!is_master_tp(tp))
+				/* Timer for repeating the ACK until an answer
+				 * arrives. Used only when establishing an additional
+				 * subflow inside of an MPTCP connection.
+				 */
+				sk_reset_timer(sk, &tp->mptcp->mptcp_ack_timer,
+					       jiffies + icsk->icsk_rto);
+		}
 #endif
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
@@ -5875,9 +5846,7 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 		else
 			tp->pred_flags = 0;
 
-		/* MPTCP: only wake-up if it's the initial subflow */
-		if ((!tp->mpc || is_master_tp(tp)) &&
-		    !sock_flag(sk, SOCK_DEAD)) {
+		if (!sock_flag(sk, SOCK_DEAD)) {
 			sk->sk_state_change(sk);
 			sk_wake_async(sk, SOCK_WAKE_IO, POLL_OUT);
 		}
@@ -6087,6 +6056,13 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				tcp_set_state(sk, TCP_ESTABLISHED);
 				sk->sk_state_change(sk);
 
+				/* Send an ACK when establishing a new
+				 * MPTCP subflow, i.e. using an MP_JOIN
+				 * subtype.
+				 */
+				if (tp->mpc && !is_master_tp(tp))
+					tcp_send_ack(sk);
+
 				/* Note, that this wakeup is only for marginal
 				 * crossed SYN case. Passively open sockets
 				 * are not waked up, because sk->sk_sleep ==
@@ -6097,10 +6073,6 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 						      SOCK_WAKE_IO, POLL_OUT);
 
 				tp->snd_una = TCP_SKB_CB(skb)->ack_seq;
-#ifdef CONFIG_MPTCP
-				if (tp->mpc && after(tp->snd_una, tp->mptcp->reinjected_seq))
-					tp->mptcp->reinjected_seq = tp->snd_una;
-#endif
 				tp->snd_wnd = ntohs(th->window) <<
 					      tp->rx_opt.snd_wscale;
 				tcp_init_wl(tp, TCP_SKB_CB(skb)->seq);
@@ -6143,11 +6115,10 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				sk->sk_shutdown |= SEND_SHUTDOWN;
 				dst_confirm(__sk_dst_get(sk));
 
-				if (!sock_flag(sk, SOCK_DEAD)) {
+				if (!sock_flag(sk, SOCK_DEAD))
 					/* Wake up lingering close() */
-					if (!tp->mpc)
-						sk->sk_state_change(sk);
-				} else {
+					sk->sk_state_change(sk);
+				else {
 					int tmo;
 
 					if (tp->linger2 < 0 ||
