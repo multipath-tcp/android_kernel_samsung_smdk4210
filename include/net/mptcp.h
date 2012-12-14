@@ -184,6 +184,7 @@ struct mptcp_cb {
 
 	/* socket count in this connection */
 	u8 cnt_subflows;
+	u8 cnt_established;
 	u8 last_pi_selected;
 
 	u32 noneligible;	/* Path mask of temporarily non
@@ -195,8 +196,9 @@ struct mptcp_cb {
 	u16 remove_addrs;
 
 	u8 dfin_path_index;
-	/* Worker struct for update-notification */
-	struct work_struct create_work;
+	/* Worker struct for subflow establishment */
+	struct work_struct subflow_work;
+	struct delayed_work subflow_retry_work;
 	/* Worker to handle interface/address changes if socket is owned */
 	struct work_struct address_work;
 	/* Mutex needed, because otherwise mptcp_close will complain that the
@@ -301,9 +303,10 @@ static inline int mptcp_pi_to_flag(int pi)
 #define MPTCP_SUB_LEN_FCLOSE	12
 #define MPTCP_SUB_LEN_FCLOSE_ALIGN	12
 
-#ifdef CONFIG_MPTCP
 
 #define OPTION_MPTCP		(1 << 5)
+
+#ifdef CONFIG_MPTCP
 
 /* MPTCP options */
 #define OPTION_TYPE_SYN		(1 << 0)
@@ -633,8 +636,15 @@ struct sock *mptcp_select_ack_sock(const struct sock *meta_sk, int copied);
 void mptcp_destroy_meta_sk(struct sock *meta_sk);
 int mptcp_backlog_rcv(struct sock *meta_sk, struct sk_buff *skb);
 struct sock *mptcp_sk_clone(struct sock *sk, int family, const gfp_t priority);
-void mptcp_init_ack_timer(struct sock *sk);
 void mptcp_ack_handler(unsigned long);
+void mptcp_set_keepalive(struct sock *sk, int val);
+
+static inline void mptcp_fragment(struct sk_buff *skb, struct sk_buff *buff)
+{
+	u8 flags = TCP_SKB_CB(skb)->mptcp_flags;
+	TCP_SKB_CB(skb)->mptcp_flags = flags & ~(MPTCPHDR_FIN);
+	TCP_SKB_CB(buff)->mptcp_flags = flags;
+}
 
 static inline void mptcp_push_pending_frames(struct sock *meta_sk)
 {
@@ -647,12 +657,17 @@ static inline void mptcp_push_pending_frames(struct sock *meta_sk)
 
 static inline void mptcp_sub_force_close(struct sock *sk)
 {
-	tcp_done(sk);
-
-	if (!sock_flag(sk, SOCK_DEAD))
-		mptcp_sub_close(sk, 0);
+	/* The below tcp_done may have freed the socket, if he is already dead.
+	 * Thus, we are not allowed to access it afterwards. That's why
+	 * we have to store the dead-state in this local variable.
+	 */
+	int sock_is_dead = sock_flag(sk, SOCK_DEAD);
 
 	tcp_sk(sk)->mp_killed = 1;
+	tcp_done(sk);
+
+	if (!sock_is_dead)
+		mptcp_sub_close(sk, 0);
 }
 
 static inline int mptcp_is_data_fin(const struct sk_buff *skb)
@@ -751,6 +766,9 @@ static inline void mptcp_hash_request_remove(struct request_sock *req)
 {
 	int in_softirq = 0;
 
+	if (list_empty(&mptcp_rsk(req)->collide_tuple))
+		return;
+
 	if (in_softirq()) {
 		spin_lock(&mptcp_reqsk_hlock);
 		in_softirq = 1;
@@ -793,20 +811,6 @@ static inline void mptcp_init_mp_opt(struct multipath_options *mopt)
 	mopt->is_mp_join = 0;
 	mopt->mptcp_rem_key = 0;
 	mopt->mpcb = NULL;
-}
-
-/**
- * This function is almost exactly the same as sk_wmem_free_skb.
- * The only difference is that we call kfree_skb instead of __kfree_skb.
- * This is important because a subsock may want to remove an skb,
- * while the meta-sock still has a reference to it.
- */
-static inline void mptcp_wmem_free_skb(struct sock *sk, struct sk_buff *skb)
-{
-	sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
-	sk->sk_wmem_queued -= skb->truesize;
-	sk_mem_uncharge(sk, skb->truesize);
-	kfree_skb(skb);
 }
 
 static inline int mptcp_check_rtt(const struct tcp_sock *tp, int time)
@@ -872,7 +876,7 @@ static inline void mptcp_path_array_check(struct sock *meta_sk)
 
 	if (unlikely(mpcb->rx_opt.list_rcvd)) {
 		mpcb->rx_opt.list_rcvd = 0;
-		mptcp_send_updatenotif(meta_sk);
+		mptcp_create_subflows(meta_sk);
 	}
 }
 
@@ -881,6 +885,9 @@ static inline int mptcp_check_snd_buf(const struct tcp_sock *tp)
 	struct tcp_sock *tp_it;
 	u32 rtt_max = tp->srtt;
 	u64 bw_est;
+
+	if (!tp->srtt)
+		return tp->reordering + 1;
 
 	mptcp_for_each_tp(tp->mpcb, tp_it)
 		if (rtt_max < tp_it->srtt)
@@ -1147,6 +1154,7 @@ static inline int mptcp_req_sk_saw_mpc(const struct request_sock *req)
 static inline void mptcp_purge_ofo_queue(struct tcp_sock *meta_tp) {}
 static inline void mptcp_cleanup_rbuf(const struct sock *meta_sk, int copied) {}
 static inline void mptcp_del_sock(const struct sock *sk) {}
+static inline void mptcp_reinject_data(struct sock *orig_sk, int clone_it) {}
 static inline void mptcp_init_buffer_space(const struct sock *sk) {}
 static inline void mptcp_update_sndbuf(const struct mptcp_cb *mpcb) {}
 static inline void mptcp_skb_entail_init(const struct tcp_sock *tp,
@@ -1186,6 +1194,7 @@ static inline void mptcp_established_options(struct sock *sk,
 static inline void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 				       struct tcp_out_options *opts,
 				       struct sk_buff *skb) {}
+static inline void mptcp_close(struct sock *meta_sk, long timeout) {}
 static inline int mptcp_doit(struct sock *sk)
 {
 	return 0;
@@ -1196,7 +1205,7 @@ static inline int mptcp_check_req_master(const struct sock *sk,
 					 struct request_sock **prev,
 					 const struct multipath_options *mopt)
 {
-	return 0;
+	return 1;
 }
 static inline struct sock *mptcp_check_req_child(const struct sock *sk,
 						 const struct sock *child,
@@ -1229,8 +1238,6 @@ static inline int mptcp_mp_fail_rcvd(struct sock *sk, struct tcphdr *th)
 	return 0;
 }
 static inline void mptcp_init_mp_opt(const struct multipath_options *mopt) {}
-static inline void mptcp_wmem_free_skb(const struct sock *sk,
-				       const struct sk_buff *skb) {}
 static inline int mptcp_check_rtt(const struct tcp_sock *tp, int time)
 {
 	return 0;
@@ -1258,6 +1265,8 @@ static inline struct sock *mptcp_sk_clone(const struct sock *sk,
 {
 	return NULL;
 }
+static inline void mptcp_set_keepalive(struct sock *sk, int val) {}
+static inline void mptcp_fragment(struct sk_buff *skb, struct sk_buff *buff) {}
 #endif /* CONFIG_MPTCP */
 
 #endif /* _MPTCP_H */

@@ -177,9 +177,10 @@ static int __mptcp_reinject_data(struct sk_buff *orig_skb, struct sock *meta_sk,
 		 */
 		skb = pskb_copy(orig_skb, GFP_ATOMIC);
 	} else {
-		skb_unlink(orig_skb, &sk->sk_write_queue);
-		skb_get(orig_skb);
-		mptcp_wmem_free_skb(sk, orig_skb);
+		__skb_unlink(orig_skb, &sk->sk_write_queue);
+		sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
+		sk->sk_wmem_queued -= orig_skb->truesize;
+		sk_mem_uncharge(sk, orig_skb->truesize);
 		skb = orig_skb;
 	}
 	if (unlikely(!skb))
@@ -194,9 +195,7 @@ static int __mptcp_reinject_data(struct sk_buff *orig_skb, struct sock *meta_sk,
 		u16 *p16;
 
 		if (!mpdss || !mpdss->M) {
-			if (clone_it)
-				__kfree_skb(skb);
-
+			__kfree_skb(skb);
 			return -1;
 		}
 
@@ -222,8 +221,7 @@ static int __mptcp_reinject_data(struct sk_buff *orig_skb, struct sock *meta_sk,
 
 	/* If it reached already the destination, we don't have to reinject it */
 	if (!after(TCP_SKB_CB(skb)->end_seq, meta_tp->snd_una)) {
-		if (clone_it)
-			__kfree_skb(skb);
+		__kfree_skb(skb);
 		return -1;
 	}
 
@@ -358,8 +356,7 @@ static void mptcp_combine_dfin(struct sk_buff *skb, struct sock *meta_sk,
  * compared to the subflow seqnum. Put another way, the dataseq referenced
  * is actually the number of the first data byte in the segment.
  */
-static struct sk_buff *mptcp_skb_entail(struct sock *sk,
-					struct sk_buff *skb,
+static struct sk_buff *mptcp_skb_entail(struct sock *sk, struct sk_buff *skb,
 					int reinject)
 {
 	__be32 *ptr;
@@ -371,9 +368,7 @@ static struct sk_buff *mptcp_skb_entail(struct sock *sk,
 	struct tcp_skb_cb *tcb;
 	struct sk_buff *subskb;
 
-	/* If the segment is reinjected, the clone is done
-	 * already
-	 */
+	/* If the segment is reinjected, the clone is done already */
 	if (reinject <= 0) {
 		if (!reinject) {
 			TCP_SKB_CB(skb)->mptcp_flags |=
@@ -389,7 +384,7 @@ static struct sk_buff *mptcp_skb_entail(struct sock *sk,
 		else
 			subskb = skb_clone(skb, GFP_ATOMIC);
 	} else {
-		skb_unlink(skb, &mpcb->reinject_queue);
+		__skb_unlink(skb, &mpcb->reinject_queue);
 		subskb = skb;
 	}
 	if (!subskb)
@@ -542,13 +537,17 @@ static void mptcp_transmit_skb_failed(struct sock *sk, struct sk_buff *skb,
 		tcp_advance_send_head(sk, subskb);
 		tcp_unlink_write_queue(subskb, sk);
 		tp->write_seq -= subskb->len;
-		if (reinject <= 0)
-			mptcp_wmem_free_skb(sk, subskb);
-		else
+		if (reinject <= 0) {
+			sk_wmem_free_skb(sk, subskb);
+		} else {
 			/* Reinjections have not been cloned,
 			 * we have to put them back on the queue.
 			 */
+			sock_set_flag(sk, SOCK_QUEUE_SHRUNK);
+			sk->sk_wmem_queued -= subskb->truesize;
+			sk_mem_uncharge(sk, subskb->truesize);
 			__skb_queue_head(&mpcb->reinject_queue, subskb);
+		}
 	}
 }
 
@@ -616,7 +615,7 @@ int mptcp_write_wakeup(struct sock *meta_sk)
 					tcp_xmit_probe_skb(sk_it, 1);
 		}
 
-		/* At least on of the tcp_xmit_probe_skb's has to succeed */
+		/* At least one of the tcp_xmit_probe_skb's has to succeed */
 		mptcp_for_each_sk(meta_tp->mpcb, sk_it) {
 			int ret = tcp_xmit_probe_skb(sk_it, 0);
 			if (unlikely(ret > 0))
@@ -765,7 +764,7 @@ int mptcp_write_xmit(struct sock *meta_sk, unsigned int mss_now, int nonagle,
 		if (reinject == 1) {
 			if (!after(TCP_SKB_CB(skb)->end_seq, meta_tp->snd_una)) {
 				/* Segment already reached the peer, take the next one */
-				skb_unlink(skb, &mpcb->reinject_queue);
+				__skb_unlink(skb, &mpcb->reinject_queue);
 				__kfree_skb(skb);
 				continue;
 			}
@@ -1509,47 +1508,32 @@ void mptcp_send_reset(struct sock *sk, struct sk_buff *skb)
 	mptcp_sub_force_close(sk);
 }
 
-void mptcp_init_ack_timer(struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-
-	setup_timer(&tp->mptcp->mptcp_ack_timer, mptcp_ack_handler,
-			(unsigned long)sk);
-}
-
-static int __mptcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
-{
-	if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk))
-		return -EHOSTUNREACH; /* Routing failure or similar */
-
-	TCP_SKB_CB(skb)->when = tcp_time_stamp;
-
-	return tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);
-}
-
 void mptcp_ack_retransmit_timer(struct sock *sk)
 {
-	struct sk_buff *buff;
+	struct sk_buff *skb;
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct inet_connection_sock *icsk = inet_csk(sk);
-	int err;
 
-	buff = alloc_skb(MAX_TCP_HEADER, GFP_ATOMIC);
-	if (buff == NULL) {
+	if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk))
+		goto out; /* Routing failure or similar */
+
+	skb = alloc_skb(MAX_TCP_HEADER, GFP_ATOMIC);
+	if (skb == NULL) {
 		sk_reset_timer(sk, &tp->mptcp->mptcp_ack_timer,
 			       jiffies + icsk->icsk_rto);
 		return;
 	}
 
 	/* Reserve space for headers and prepare control bits */
-	skb_reserve(buff, MAX_TCP_HEADER);
-	tcp_init_nondata_skb(buff, tp->snd_nxt, TCPHDR_ACK);
+	skb_reserve(skb, MAX_TCP_HEADER);
+	/* snd_una - 1, because we want to trigger the peer to send
+	 * immediatly an ack back and acknowledge this.
+	 */
+	tcp_init_nondata_skb(skb, tp->snd_una - 1, TCPHDR_ACK);
 
-	icsk->icsk_retransmits++;
 	mptcp_include_mpc(tp);
-	err = __mptcp_retransmit_skb(sk, buff);
-
-	if (err > 0) {
+	TCP_SKB_CB(skb)->when = tcp_time_stamp;
+	if (tcp_transmit_skb(sk, skb, 0, GFP_ATOMIC) > 0) {
 		/* Retransmission failed because of local congestion,
 		 * do not backoff. */
 		if (!icsk->icsk_retransmits)
@@ -1559,11 +1543,12 @@ void mptcp_ack_retransmit_timer(struct sock *sk)
 		return;
 	}
 
+out:
+	icsk->icsk_retransmits++;
 	if (icsk->icsk_retransmits == sysctl_tcp_retries1 + 1) {
 		sk_stop_timer(sk, &tp->mptcp->mptcp_ack_timer);
 		tcp_send_active_reset(sk, GFP_ATOMIC);
 		mptcp_sub_force_close(sk);
-		kfree_skb(buff);
 		return;
 	}
 
@@ -1584,6 +1569,9 @@ void mptcp_ack_handler(unsigned long data)
 			       jiffies + (HZ / 20));
 		goto out_unlock;
 	}
+
+	if (sk->sk_state == TCP_CLOSE)
+		goto out_unlock;
 
 	mptcp_ack_retransmit_timer(sk);
 
@@ -1672,7 +1660,9 @@ static int mptcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
 		}
 	}
 
-	err = __mptcp_retransmit_skb(sk, skb);
+
+	TCP_SKB_CB(skb)->when = tcp_time_stamp;
+	err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC);
 	if (err == 0) {
 		/* Update global TCP statistics. */
 		TCP_INC_STATS(sock_net(meta_sk), TCP_MIB_RETRANSSEGS);

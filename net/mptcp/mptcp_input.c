@@ -38,7 +38,7 @@ static inline void mptcp_become_fully_estab(struct sock *sk)
 	tcp_sk(sk)->mptcp->fully_established = 1;
 
 	if (is_master_tp(tcp_sk(sk)))
-		mptcp_send_updatenotif(mptcp_meta_sk(sk));
+		mptcp_create_subflows(mptcp_meta_sk(sk));
 }
 
 /**
@@ -87,8 +87,8 @@ static void mptcp_clean_rtx_queue(struct sock *meta_sk)
 		if (before(meta_tp->snd_una, TCP_SKB_CB(skb)->end_seq))
 			break;
 
-		skb_unlink(skb, &mpcb->reinject_queue);
-		kfree_skb(skb);
+		__skb_unlink(skb, &mpcb->reinject_queue);
+		__kfree_skb(skb);
 	}
 
 	if (acked) {
@@ -813,6 +813,7 @@ static int mptcp_queue_skb(struct sock *sk)
 			mptcp_prepare_skb(tmp1, tmp, sk);
 			__skb_unlink(tmp1, &sk->sk_receive_queue);
 
+			eaten = 0;
 			/* Is direct copy possible ? */
 			if (TCP_SKB_CB(tmp1)->seq == meta_tp->rcv_nxt &&
 			    meta_tp->ucopy.task == current &&

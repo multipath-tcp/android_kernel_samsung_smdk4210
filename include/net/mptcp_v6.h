@@ -62,11 +62,12 @@ void mptcp_v6_set_init_addr_bit(struct mptcp_cb *mpcb,
 				const struct in6_addr *daddr);
 struct sock *mptcp_v6_search_req(const __be16 rport, const struct in6_addr *raddr,
 				 const struct in6_addr *laddr);
-void mptcp_init6_subsockets(struct sock *meta_sk, const struct mptcp_loc6 *loc,
-			    struct mptcp_rem6 *rem);
+int mptcp_init6_subsockets(struct sock *meta_sk, const struct mptcp_loc6 *loc,
+			   struct mptcp_rem6 *rem);
 void mptcp_pm_addr6_event_handler(struct inet6_ifaddr *ifa, unsigned long event,
 				  struct mptcp_cb *mpcb);
 int mptcp_pm_v6_init(void);
+void mptcp_pm_v6_undo(void);
 void mptcp_v6_send_add_addr(int loc_id, struct mptcp_cb *mpcb);
 struct sock *mptcp_v6v4_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 				      struct request_sock *req,

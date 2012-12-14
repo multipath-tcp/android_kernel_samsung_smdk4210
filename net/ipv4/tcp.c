@@ -948,7 +948,7 @@ int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 			goto out_err;
 
 	if (tp->mpc) {
-		struct sock *sk_it;
+		struct sock *sk_it = sk;
 
 		mptcp_for_each_sk(tp->mpcb, sk_it) {
 			if (!is_master_tp(tcp_sk(sk_it)))
@@ -1247,6 +1247,11 @@ void tcp_cleanup_rbuf(struct sock *sk, int copied)
 #if TCP_DEBUG
 	struct sk_buff *skb = skb_peek(&sk->sk_receive_queue);
 
+	if (is_meta_sk(sk)) {
+		mptcp_cleanup_rbuf(sk, copied);
+		return;
+	}
+
 	WARN(skb && !before(tp->copied_seq, TCP_SKB_CB(skb)->end_seq),
 	     "cleanup rbuf bug: copied %X seq %X rcvnxt %X\n",
 	     tp->copied_seq, TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt);
@@ -1439,10 +1444,7 @@ int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 
 	/* Clean up data we have read: This will do ACK frames. */
 	if (copied > 0) {
-		if (tp->mpc)
-			mptcp_cleanup_rbuf(sk, copied);
-		else
-			tcp_cleanup_rbuf(sk, copied);
+		tcp_cleanup_rbuf(sk, copied);
 		uid_stat_tcp_rcv(current_uid(), copied);
 	}
 
@@ -1609,10 +1611,7 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 			}
 		}
 
-		if (tp->mpc)
-			mptcp_cleanup_rbuf(sk, copied);
-		else
-			tcp_cleanup_rbuf(sk, copied);
+		tcp_cleanup_rbuf(sk, copied);
 
 		if (!sysctl_tcp_low_latency && tp->ucopy.task == user_recv) {
 			/* Install new reader */
@@ -1837,10 +1836,7 @@ skip_copy:
 	 */
 
 	/* Clean up data we have read: This will do ACK frames. */
-	if (tp->mpc)
-		mptcp_cleanup_rbuf(sk, copied);
-	else
-		tcp_cleanup_rbuf(sk, copied);
+	tcp_cleanup_rbuf(sk, copied);
 
 	release_sock(sk);
 
@@ -2444,6 +2440,13 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 					elapsed = tp->keepalive_time - elapsed;
 				else
 					elapsed = 0;
+				if (tp->mpc) {
+					struct sock *sk_it = sk;
+					mptcp_for_each_sk(tp->mpcb, sk_it)
+						if (!(1 << sk->sk_state & (TCPF_CLOSE | TCPF_LISTEN)))
+							inet_csk_reset_keepalive_timer(sk_it, elapsed);
+					break;
+				}
 				inet_csk_reset_keepalive_timer(sk, elapsed);
 			}
 		}

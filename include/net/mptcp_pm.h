@@ -46,6 +46,8 @@
  * When changing, see the bitfield below in mptcp_loc4/6. */
 #define MPTCP_MAX_ADDR	8
 
+#define MPTCP_SUBFLOW_RETRY_DELAY	1000
+
 struct mptcp_loc4 {
 	u8		id;
 	u8		low_prio:1;
@@ -56,6 +58,7 @@ struct mptcp_loc4 {
 struct mptcp_rem4 {
 	u8		id;
 	u8		bitfield;
+	u8		retry_bitfield;
 	__be16		port;
 	struct in_addr	addr;
 };
@@ -70,6 +73,7 @@ struct mptcp_loc6 {
 struct mptcp_rem6 {
 	u8		id;
 	u8		bitfield;
+	u8		retry_bitfield;
 	__be16		port;
 	struct in6_addr	addr;
 };
@@ -92,8 +96,9 @@ extern spinlock_t mptcp_reqsk_hlock;	/* hashtable protection */
  */
 extern spinlock_t mptcp_tk_hashlock;	/* hashtable protection */
 
-void mptcp_send_updatenotif(struct sock *meta_sk);
-void mptcp_send_updatenotif_wq(struct work_struct *work);
+void mptcp_create_subflows(struct sock *meta_sk);
+void mptcp_create_subflow_worker(struct work_struct *work);
+void mptcp_retry_subflow_worker(struct work_struct *work);
 struct mp_join *mptcp_find_join(struct sk_buff *skb);
 u8 mptcp_get_loc_addrid(struct mptcp_cb *mpcb, struct sock *sk);
 void __mptcp_hash_insert(struct tcp_sock *meta_tp, u32 token);
@@ -112,7 +117,8 @@ void mptcp_set_addresses(struct sock *meta_sk);
 int mptcp_check_req(struct sk_buff *skb);
 void mptcp_address_worker(struct work_struct *work);
 int mptcp_pm_addr_event_handler(unsigned long event, void *ptr, int family);
-struct sock *mptcp_select_loc_sock(const struct mptcp_cb *mpcb, u16 ids);
+int mptcp_pm_init(void);
+void mptcp_pm_undo(void);
 
 #else /* CONFIG_MPTCP */
 static inline void mptcp_reqsk_new_mptcp(struct request_sock *req,

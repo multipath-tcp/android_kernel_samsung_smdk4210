@@ -46,9 +46,10 @@ static void mptcp_v4_reqsk_destructor(struct request_sock *req)
 {
 	mptcp_reqsk_destructor(req);
 
-	kfree(inet_rsk(req)->opt);
+	tcp_v4_reqsk_destructor(req);
 }
 
+/* Similar to tcp_request_sock_ops */
 struct request_sock_ops mptcp_request_sock_ops __read_mostly = {
 	.family		=	PF_INET,
 	.obj_size	=	sizeof(struct mptcp_request_sock),
@@ -59,94 +60,136 @@ struct request_sock_ops mptcp_request_sock_ops __read_mostly = {
 	.syn_ack_timeout =	tcp_syn_ack_timeout,
 };
 
-static void mptcp_v4_reqsk_queue_hash_add(struct request_sock *req,
+static void mptcp_v4_reqsk_queue_hash_add(struct sock *meta_sk,
+					  struct request_sock *req,
 					  unsigned long timeout)
 {
-	struct inet_connection_sock *meta_icsk = inet_csk(mptcp_rsk(req)->mpcb->meta_sk);
-	struct listen_sock *lopt = meta_icsk->icsk_accept_queue.listen_opt;
-	const u32 h_local = inet_synq_hash(inet_rsk(req)->rmt_addr,
-					   inet_rsk(req)->rmt_port,
-					   lopt->hash_rnd,
-					   lopt->nr_table_entries);
-	const u32 h_global = inet_synq_hash(inet_rsk(req)->rmt_addr,
-					    inet_rsk(req)->rmt_port,
-					    0,
-					    MPTCP_HASH_SIZE);
-	spin_lock_bh(&mptcp_reqsk_hlock);
-	reqsk_queue_hash_req(&meta_icsk->icsk_accept_queue,
-			     h_local, req, timeout);
-	list_add(&mptcp_rsk(req)->collide_tuple, &mptcp_reqsk_htb[h_global]);
-	lopt->qlen++;
-	spin_unlock_bh(&mptcp_reqsk_hlock);
+	const u32 h = inet_synq_hash(inet_rsk(req)->rmt_addr,
+				     inet_rsk(req)->rmt_port,
+				     0, MPTCP_HASH_SIZE);
+
+	inet_csk_reqsk_queue_hash_add(meta_sk, req, timeout);
+
+	spin_lock(&mptcp_reqsk_hlock);
+	list_add(&mptcp_rsk(req)->collide_tuple, &mptcp_reqsk_htb[h]);
+	spin_unlock(&mptcp_reqsk_hlock);
 }
 
-/* from mptcp_v4_join_request() */
+/* Similar to tcp_v4_conn_request */
 static void mptcp_v4_join_request_short(struct sock *meta_sk,
 					struct sk_buff *skb,
 					struct tcp_options_received *tmp_opt)
 {
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
-	struct request_sock *req, **prev;
+	struct request_sock *req;
 	struct inet_request_sock *ireq;
 	struct mptcp_request_sock *mtreq;
+	struct dst_entry *dst = NULL;
 	u8 mptcp_hash_mac[20];
 	__be32 saddr = ip_hdr(skb)->saddr;
 	__be32 daddr = ip_hdr(skb)->daddr;
 	__u32 isn = TCP_SKB_CB(skb)->when;
+	int want_cookie = 0;
 
 	req = inet_reqsk_alloc(&mptcp_request_sock_ops);
 	if (!req)
 		return;
 
-	tmp_opt->tstamp_ok = tmp_opt->saw_tstamp;
-
 	mtreq = mptcp_rsk(req);
 	mtreq->mpcb = mpcb;
+	INIT_LIST_HEAD(&mtreq->collide_tuple);
 	mtreq->mptcp_rem_nonce = tmp_opt->mptcp_recv_nonce;
 	mtreq->mptcp_rem_key = mpcb->mptcp_rem_key;
 	mtreq->mptcp_loc_key = mpcb->mptcp_loc_key;
-
 	get_random_bytes(&mtreq->mptcp_loc_nonce,
 			 sizeof(mtreq->mptcp_loc_nonce));
-
 	mptcp_hmac_sha1((u8 *)&mtreq->mptcp_loc_key,
 			(u8 *)&mtreq->mptcp_rem_key,
 			(u8 *)&mtreq->mptcp_loc_nonce,
 			(u8 *)&mtreq->mptcp_rem_nonce, (u32 *)mptcp_hash_mac);
 	mtreq->mptcp_hash_tmac = *(u64 *)mptcp_hash_mac;
-
 	mtreq->rem_id = tmp_opt->rem_id;
 	mtreq->low_prio = tmp_opt->low_prio;
 
+	tmp_opt->tstamp_ok = tmp_opt->saw_tstamp;
 	tcp_openreq_init(req, tmp_opt, skb);
 
 	ireq = inet_rsk(req);
 	ireq->loc_addr = daddr;
 	ireq->rmt_addr = saddr;
-	ireq->opt = tcp_v4_save_options(NULL, skb);
+	ireq->no_srccheck = inet_sk(meta_sk)->transparent;
+	ireq->opt = tcp_v4_save_options(meta_sk, skb);
 
-	/* Todo: add the sanity checks here. See tcp_v4_conn_request */
+	if (security_inet_conn_request(meta_sk, skb, req))
+		goto drop_and_free;
 
-	isn = tcp_v4_init_sequence(skb);
+	if (!want_cookie || tmp_opt->tstamp_ok)
+		TCP_ECN_create_request(req, tcp_hdr(skb));
 
+	if (!isn) {
+		struct inet_peer *peer = NULL;
+		struct flowi4 fl4;
+
+		/* VJ's idea. We save last timestamp seen
+		 * from the destination in peer table, when entering
+		 * state TIME-WAIT, and check against it before
+		 * accepting new connection request.
+		 *
+		 * If "isn" is not zero, this request hit alive
+		 * timewait bucket, so that all the necessary checks
+		 * are made in the function processing timewait state.
+		 */
+		if (tmp_opt->saw_tstamp &&
+		    tcp_death_row.sysctl_tw_recycle &&
+		    (dst = inet_csk_route_req(meta_sk, &fl4, req)) != NULL &&
+		    fl4.daddr == saddr &&
+		    (peer = rt_get_peer((struct rtable *)dst, fl4.daddr)) != NULL) {
+			inet_peer_refcheck(peer);
+			if ((u32)get_seconds() - peer->tcp_ts_stamp < TCP_PAWS_MSL &&
+			    (s32)(peer->tcp_ts - req->ts_recent) >
+							TCP_PAWS_WINDOW) {
+				NET_INC_STATS_BH(sock_net(meta_sk), LINUX_MIB_PAWSPASSIVEREJECTED);
+				goto drop_and_release;
+			}
+		}
+		/* Kill the following clause, if you dislike this way. */
+		else if (!sysctl_tcp_syncookies &&
+			 (sysctl_max_syn_backlog - inet_csk_reqsk_queue_len(meta_sk) <
+			  (sysctl_max_syn_backlog >> 2)) &&
+			 (!peer || !peer->tcp_ts_stamp) &&
+			 (!dst || !dst_metric(dst, RTAX_RTT))) {
+			/* Without syncookies last quarter of
+			 * backlog is filled with destinations,
+			 * proven to be alive.
+			 * It means that we continue to communicate
+			 * to destinations, already remembered
+			 * to the moment of synflood.
+			 */
+			LIMIT_NETDEBUG(KERN_DEBUG "TCP: drop open request from %pI4/%u\n",
+				       &saddr, ntohs(tcp_hdr(skb)->source));
+			goto drop_and_release;
+		}
+
+		isn = tcp_v4_init_sequence(skb);
+	}
 	tcp_rsk(req)->snt_isn = isn;
 
-	/* Adding to request queue in metasocket */
-	mptcp_v4_reqsk_queue_hash_add(req, TCP_TIMEOUT_INIT);
-
-	if (tcp_v4_send_synack(meta_sk, NULL, req, NULL))
+	if (tcp_v4_send_synack(meta_sk, dst, req, NULL))
 		goto drop_and_free;
+
+	/* Adding to request queue in metasocket */
+	mptcp_v4_reqsk_queue_hash_add(meta_sk, req, TCP_TIMEOUT_INIT);
 
 	return;
 
+drop_and_release:
+	dst_release(dst);
 drop_and_free:
-	req = inet_csk_search_req(meta_sk, &prev, inet_rsk(req)->rmt_port,
-				  saddr, daddr);
-	inet_csk_reqsk_queue_drop(meta_sk, req, prev);
+	reqsk_free(req);
 	return;
 }
 
-/* from tcp_v4_conn_request() */
+/* Similar to tcp_v6_conn_request, with subsequent call to mptcp_v4_join_request_short */
 static void mptcp_v4_join_request(struct sock *meta_sk, struct sk_buff *skb)
 {
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
@@ -195,7 +238,8 @@ int mptcp_v4_add_raddress(struct multipath_options *mopt,
 		rem4 = &mopt->addr4[i];
 
 		/* Address is already in the list --- continue */
-		if (rem4->addr.s_addr == addr->s_addr && rem4->port == port)
+		if (rem4->id == id &&
+		    rem4->addr.s_addr == addr->s_addr && rem4->port == port)
 			return 0;
 
 		/* This may be the case, when the peer is behind a NAT. He is
@@ -231,6 +275,7 @@ int mptcp_v4_add_raddress(struct multipath_options *mopt,
 	rem4->addr.s_addr = addr->s_addr;
 	rem4->port = port;
 	rem4->bitfield = 0;
+	rem4->retry_bitfield = 0;
 	rem4->id = id;
 	mopt->list_rcvd = 1;
 	mopt->rem4_bits |= (1 << i);
@@ -239,7 +284,8 @@ int mptcp_v4_add_raddress(struct multipath_options *mopt,
 }
 
 /* Sets the bitfield of the remote-address field
- * local address is not set as it will disappear with the global address-list */
+ * local address is not set as it will disappear with the global address-list
+ */
 void mptcp_v4_set_init_addr_bit(struct mptcp_cb *mpcb, __be32 daddr)
 {
 	int i;
@@ -253,9 +299,7 @@ void mptcp_v4_set_init_addr_bit(struct mptcp_cb *mpcb, __be32 daddr)
 	}
 }
 
-/**
- * Fast processing for SYN+MP_JOIN.
- */
+/* Fast processing for SYN+MP_JOIN. */
 void mptcp_v4_do_rcv_join_syn(struct sock *meta_sk, struct sk_buff *skb,
 			      struct tcp_options_received *tmp_opt)
 {
@@ -295,35 +339,37 @@ reset:
 	return;
 }
 
-/**
- * We only process join requests here. (either the SYN or the final ACK)
- */
+/* We only process join requests here. (either the SYN or the final ACK) */
 int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 {
 	struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;
-	struct sock *child;
+	struct sock *child, *rsk = NULL;
+	int ret;
 
 	if (!(TCP_SKB_CB(skb)->mptcp_flags & MPTCPHDR_JOIN)) {
 		struct tcphdr *th = tcp_hdr(skb);
 		const struct iphdr *iph = ip_hdr(skb);
 		struct sock *sk;
-		int ret;
 
 		sk = inet_lookup_established(sock_net(meta_sk), &tcp_hashinfo,
 					     iph->saddr, th->source, iph->daddr,
 					     th->dest, inet_iif(skb));
 
-		if (is_meta_sk(sk)) {
-			WARN("%s Did not find a sub-sk - did found the meta!\n", __func__);
-			return 0;
-		}
 		if (!sk) {
 			WARN("%s Did not find a sub-sk at all!!!\n", __func__);
+			kfree_skb(skb);
+			return 0;
+		}
+		if (is_meta_sk(sk)) {
+			WARN("%s Did not find a sub-sk - did found the meta!\n", __func__);
+			kfree_skb(skb);
+			sock_put(sk);
 			return 0;
 		}
 
 		if (sk->sk_state == TCP_TIME_WAIT) {
 			inet_twsk_put(inet_twsk(sk));
+			kfree_skb(skb);
 			return 0;
 		}
 
@@ -352,8 +398,12 @@ int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 		 * already the meta-sk-lock and are sure that it is not owned
 		 * by the user.
 		 */
-		tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb->len);
+		ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb->len);
 		sock_put(child);
+		if (ret) {
+			rsk = child;
+			goto reset_and_discard;
+		}
 	} else {
 		if (tcp_hdr(skb)->syn) {
 			struct mp_join *join_opt = mptcp_find_join(skb);
@@ -373,14 +423,13 @@ int mptcp_v4_do_rcv(struct sock *meta_sk, struct sk_buff *skb)
 	return 0;
 
 reset_and_discard:
-	tcp_v4_send_reset(NULL, skb);
+	tcp_v4_send_reset(rsk, skb);
 discard:
 	kfree_skb(skb);
 	return 0;
 }
 
-/**
- * After this, the ref count of the meta_sk associated with the request_sock
+/* After this, the ref count of the meta_sk associated with the request_sock
  * is incremented. Thus it is the responsibility of the caller
  * to call sock_put() when the reference is not needed anymore.
  */
@@ -413,13 +462,12 @@ struct sock *mptcp_v4_search_req(const __be16 rport, const __be32 raddr,
 	return meta_sk;
 }
 
-/**
- * Create a new IPv4 subflow.
+/* Create a new IPv4 subflow.
  *
  * We are in user-context and meta-sock-lock is hold.
  */
-void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
-			    struct mptcp_rem4 *rem)
+int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
+			   struct mptcp_rem4 *rem)
 {
 	struct tcp_sock *tp;
 	struct sock *sk;
@@ -441,7 +489,7 @@ void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	ret = inet_create(sock_net(meta_sk), &sock, IPPROTO_TCP, 1);
 	if (unlikely(ret < 0)) {
 		mptcp_debug("%s inet_create failed ret: %d\n", __func__, ret);
-		return;
+		return ret;
 	}
 
 	sk = sock.sk;
@@ -454,7 +502,7 @@ void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	tp->mptcp->low_prio = loc->low_prio;
 
 	/* Initializing the timer for an MPTCP subflow */
-	mptcp_init_ack_timer(sk);
+	setup_timer(&tp->mptcp->mptcp_ack_timer, mptcp_ack_handler, (unsigned long)sk);
 
 	/** Then, connect the socket to the peer */
 
@@ -492,7 +540,7 @@ void mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
 	sk_set_socket(sk, meta_sk->sk_socket);
 	sk->sk_wq = meta_sk->sk_wq;
 
-	return;
+	return 0;
 
 error:
 	sock_orphan(sk);
@@ -502,23 +550,19 @@ error:
 	tcp_done(sk);
 	local_bh_enable();
 
-	return;
+	return ret;
 }
 
 /****** IPv4-Address event handler ******/
 
-/**
- * React on IP-addr add/rem-events
- */
+/* React on IP-addr add/rem-events */
 static int mptcp_pm_inetaddr_event(struct notifier_block *this,
 				   unsigned long event, void *ptr)
 {
 	return mptcp_pm_addr_event_handler(event, ptr, AF_INET);
 }
 
-/**
- * React on ifup/down-events
- */
+/* React on ifup/down-events */
 static int mptcp_pm_netdev_event(struct notifier_block *this,
 				 unsigned long event, void *ptr)
 {
@@ -584,7 +628,7 @@ void mptcp_pm_addr4_event_handler(struct in_ifaddr *ifa, unsigned long event,
 		/* re-send addresses */
 		mptcp_v4_send_add_addr(i, mpcb);
 		/* re-evaluate paths */
-		mptcp_send_updatenotif(mpcb->meta_sk);
+		mptcp_create_subflows(mpcb->meta_sk);
 	}
 	return;
 found:
@@ -597,7 +641,7 @@ found:
 			continue;
 
 		if (event == NETDEV_DOWN) {
-			mptcp_reinject_data(sk, 1);
+			mptcp_reinject_data(sk, 0);
 			mptcp_sub_force_close(sk);
 		} else if (event == NETDEV_CHANGE) {
 			int new_low_prio = (ifa->ifa_dev->dev->flags & IFF_MPBACKUP) ?
@@ -622,9 +666,7 @@ found:
 	}
 }
 
-/*
- * Send ADD_ADDR for loc_id on all available subflows
- */
+/* Send ADD_ADDR for loc_id on all available subflows */
 void mptcp_v4_send_add_addr(int loc_id, struct mptcp_cb *mpcb)
 {
 	struct tcp_sock *tp;
@@ -643,9 +685,7 @@ static struct notifier_block mptcp_pm_netdev_notifier = {
 
 /****** End of IPv4-Address event handler ******/
 
-/*
- * General initialization of IPv4 for MPTCP
- */
+/* General initialization of IPv4 for MPTCP */
 int mptcp_pm_v4_init(void)
 {
 	int ret;
@@ -661,7 +701,6 @@ int mptcp_pm_v4_init(void)
 				      SLAB_HWCACHE_ALIGN, NULL);
 
 	if (ops->slab == NULL) {
-		printk(KERN_CRIT "%s: Can't create request sock SLAB cache!\n", "MPTCP");
 		ret =  -ENOMEM;
 		goto err_reqsk_create;
 	}
@@ -685,4 +724,13 @@ err_reqsk_create:
 	ops->slab_name = NULL;
 	goto out;
 }
+
+void mptcp_pm_v4_undo(void)
+{
+	unregister_inetaddr_notifier(&mptcp_pm_inetaddr_notifier);
+	unregister_netdevice_notifier(&mptcp_pm_netdev_notifier);
+	kmem_cache_destroy(mptcp_request_sock_ops.slab);
+	kfree(mptcp_request_sock_ops.slab_name);
+}
+
 
