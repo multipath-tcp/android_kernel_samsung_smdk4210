@@ -335,7 +335,7 @@ extern const struct inet_connection_sock_af_ops ipv4_specific;
 extern const struct inet_connection_sock_af_ops ipv6_specific;
 extern const struct inet_connection_sock_af_ops ipv6_mapped;
 
-struct multipath_options;
+struct mptcp_options_received;
 
 extern int tcp_close_state(struct sock *sk);
 extern void tcp_push(struct sock *sk, int flags, int mss_now,
@@ -345,8 +345,6 @@ extern void tcp_cwnd_validate(struct sock *sk);
 extern void tcp_event_new_data_sent(struct sock *sk, const struct sk_buff *skb);
 extern int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 			    gfp_t gfp_mask);
-extern int tso_fragment(struct sock *sk, struct sk_buff *skb, unsigned int len,
-			unsigned int mss_now, gfp_t gfp);
 extern unsigned int tcp_mss_split_point(const struct sock *sk, const struct sk_buff *skb,
 					unsigned int mss_now, unsigned int cwnd);
 extern int tcp_tso_should_defer(struct sock *sk, struct sk_buff *skb);
@@ -372,7 +370,8 @@ extern bool retransmits_timed_out(struct sock *sk, unsigned int boundary,
 				  unsigned int timeout, bool syn_set);
 extern void tcp_write_err(struct sock *sk);
 extern void tcp_adjust_pcount(struct sock *sk, const struct sk_buff *skb, int decr);
-
+extern void tcp_set_skb_tso_segs(const struct sock *sk, struct sk_buff *skb,
+				 unsigned int mss_now);
 
 extern int tcp_v4_rtx_synack(struct sock *sk, struct request_sock *req,
 			     struct request_values *rvp);
@@ -410,6 +409,9 @@ extern struct sock *tcp_v6_syn_recv_sock(struct sock *sk, struct sk_buff *skb,
 extern void tcp_v6_reqsk_destructor(struct request_sock *req);
 
 extern void sock_valbool_flag(struct sock *sk, int bit, int valbool);
+
+extern void skb_clone_fraglist(struct sk_buff *skb);
+extern void copy_skb_header(struct sk_buff *new, const struct sk_buff *old);
 /**** END - Exports needed for MPTCP ****/
 
 extern void tcp_v4_err(struct sk_buff *skb, u32);
@@ -429,7 +431,7 @@ extern int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg);
 extern int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				 struct tcphdr *th, unsigned len);
 extern int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
-			       struct tcphdr *th, unsigned len);
+			       struct tcphdr *th, unsigned int len);
 extern void tcp_rcv_space_adjust(struct sock *sk);
 extern void tcp_cleanup_rbuf(struct sock *sk, int copied);
 extern int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp);
@@ -502,7 +504,7 @@ extern int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 		       size_t len, int nonblock, int flags, int *addr_len);
 extern void tcp_parse_options(const struct sk_buff *skb,
 			      struct tcp_options_received *opt_rx, const u8 **hvpp,
-			      struct multipath_options *mopt, int estab);
+			      struct mptcp_options_received *mopt, int estab);
 extern u8 *tcp_parse_md5sig_option(struct tcphdr *th);
 
 /*
@@ -706,7 +708,6 @@ extern u32 __tcp_select_window(struct sock *sk);
 #define MPTCPHDR_SEQ64_SET	0x10 /* Did we received a 64-bit seq number */
 #define MPTCPHDR_SEQ64_OFO	0x20 /* Is it not in our circular array? */
 #define MPTCPHDR_SEQ64_INDEX	0x40 /* Index of seq in mpcb->snd_high_order */
-#define MPTCPHDR_ACK64_SET	0x80
 
 /* It is impossible, that all 8 bits of mptcp_flags are set to 1 with the above
  * Thus, defining MPTCPHDR_JOIN as 0xFF is safe.
@@ -1119,7 +1120,7 @@ static inline void tcp_openreq_init(struct request_sock *req,
 	req->rcv_wnd = 0;		/* So that tcp_send_synack() knows! */
 	req->cookie_ts = 0;
 	tcp_rsk(req)->rcv_isn = TCP_SKB_CB(skb)->seq;
-	tcp_rsk(req)->saw_mpc = rx_opt->saw_mpc;
+	tcp_rsk(req)->saw_mpc = 0;
 	req->mss = rx_opt->mss_clamp;
 	req->ts_recent = rx_opt->saw_tstamp ? rx_opt->rcv_tsval : 0;
 	ireq->tstamp_ok = rx_opt->tstamp_ok;

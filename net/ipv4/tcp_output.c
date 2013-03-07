@@ -121,7 +121,7 @@ static __u16 tcp_advertise_mss(struct sock *sk)
 	struct dst_entry *dst = __sk_dst_get(sk);
 	int mss = tp->advmss;
 
-	if (!tp->mpc && dst) {
+	if (dst) {
 		unsigned int metric = dst_metric_advmss(dst);
 
 		if (metric < mss) {
@@ -621,7 +621,7 @@ static unsigned tcp_syn_options(struct sock *sk, struct sk_buff *skb,
 		if (unlikely(!(OPTION_TS & opts->options)))
 			remaining -= TCPOLEN_SACKPERM_ALIGNED;
 	}
-	if (tp->request_mptcp)
+	if (tp->request_mptcp || tp->mpc)
 		mptcp_syn_options(sk, opts, &remaining);
 
 	/* Note that timestamps are required by the specification.
@@ -837,7 +837,7 @@ int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
 	tp = tcp_sk(sk);
 
 	if (likely(clone_it)) {
-		if (unlikely((!tp->mpc && skb_cloned(skb)) || mptcp_skb_cloned(skb, tp))) {
+		if (unlikely(skb_cloned(skb))) {
 			struct sk_buff *newskb;
 			if (mptcp_is_data_seq(skb))
 				skb_push(skb, MPTCP_SUB_LEN_DSS_ALIGN +
@@ -966,11 +966,11 @@ void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
 }
 
 /* Initialize TSO segments for a packet. */
-static void tcp_set_skb_tso_segs(const struct sock *sk, struct sk_buff *skb,
-				 unsigned int mss_now)
+void tcp_set_skb_tso_segs(const struct sock *sk, struct sk_buff *skb,
+			  unsigned int mss_now)
 {
 	if (skb->len <= mss_now || !sk_can_gso(sk) ||
-	    skb->ip_summed == CHECKSUM_NONE) {
+	    skb->ip_summed == CHECKSUM_NONE || tcp_sk(sk)->mpc) {
 		/* Avoid the costly divide in the normal
 		 * non-TSO case.
 		 */
@@ -1076,8 +1076,6 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
 	TCP_SKB_CB(skb)->flags = flags & ~(TCPHDR_FIN | TCPHDR_PSH);
 	TCP_SKB_CB(buff)->flags = flags;
 	TCP_SKB_CB(buff)->sacked = TCP_SKB_CB(skb)->sacked;
-	if (tp->mpc)
-		mptcp_fragment(skb, buff);
 
 	if (!skb_shinfo(skb)->nr_frags && skb->ip_summed != CHECKSUM_PARTIAL) {
 		/* Copy and checksum data tail into the new buffer. */
@@ -1179,6 +1177,14 @@ int tcp_trim_head(struct sock *sk, struct sk_buff *skb, u32 len)
 	/* Any change of skb->len requires recalculation of tso factor. */
 	if (tcp_skb_pcount(skb) > 1)
 		tcp_set_skb_tso_segs(sk, skb, tcp_skb_mss(skb));
+
+#ifdef CONFIG_MPTCP
+	/* Some data got acked - we assume that the seq-number reached the dest.
+	 * Anyway, our MPTCP-option has been trimmed above - we lost it here.
+	 */
+	if (tcp_sk(sk)->mpc)
+		TCP_SKB_CB(skb)->mptcp_flags &= ~MPTCPHDR_SEQ;
+#endif
 
 	return 0;
 }
@@ -1296,10 +1302,6 @@ unsigned int tcp_current_mss(struct sock *sk)
 	unsigned header_len;
 	struct tcp_out_options opts;
 	struct tcp_md5sig_key *md5;
-
-	/* if sk is the meta-socket, return the common MSS */
-	if (tp->mpc)
-		return mptcp_sysctl_mss();
 
 	mss_now = tp->mss_cache;
 
@@ -1484,11 +1486,10 @@ static unsigned int tcp_snd_test(struct sock *sk, struct sk_buff *skb,
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int cwnd_quota;
-	const struct tcp_sock *meta_tp = tp->mpc ? mptcp_meta_tp(tp) : tp;
 
 	tcp_init_tso_segs(sk, skb, cur_mss);
 
-	if (!tcp_nagle_test(meta_tp, skb, cur_mss, nonagle))
+	if (!tcp_nagle_test(tp, skb, cur_mss, nonagle))
 		return 0;
 
 	cwnd_quota = tcp_cwnd_test(tp, skb);
@@ -1517,8 +1518,8 @@ int tcp_may_send_now(struct sock *sk)
  * know that all the data is in scatter-gather pages, and that the
  * packet has never been sent out before (and thus is not cloned).
  */
-int tso_fragment(struct sock *sk, struct sk_buff *skb, unsigned int len,
-		 unsigned int mss_now, gfp_t gfp)
+static int tso_fragment(struct sock *sk, struct sk_buff *skb, unsigned int len,
+			unsigned int mss_now, gfp_t gfp)
 {
 	struct sk_buff *buff;
 	int nlen = skb->len - len;
@@ -1546,8 +1547,6 @@ int tso_fragment(struct sock *sk, struct sk_buff *skb, unsigned int len,
 	flags = TCP_SKB_CB(skb)->flags;
 	TCP_SKB_CB(skb)->flags = flags & ~(TCPHDR_FIN | TCPHDR_PSH);
 	TCP_SKB_CB(buff)->flags = flags;
-	if (tcp_sk(sk)->mpc)
-		mptcp_fragment(skb, buff);
 
 	/* This packet was never sent out yet, so no SACK bits. */
 	TCP_SKB_CB(buff)->sacked = 0;
@@ -2495,11 +2494,7 @@ struct sk_buff *tcp_make_synack(struct sock *sk, struct dst_entry *dst,
 
 	skb_dst_set(skb, dst_clone(dst));
 
-	if (mptcp_req_sk_saw_mpc(req))
-		mss = mptcp_sysctl_mss();
-	else
-		mss = dst_metric_advmss(dst);
-
+	mss = dst_metric_advmss(dst);
 	if (tp->rx_opt.user_mss && tp->rx_opt.user_mss < mss)
 		mss = tp->rx_opt.user_mss;
 
@@ -2514,7 +2509,8 @@ struct sk_buff *tcp_make_synack(struct sock *sk, struct dst_entry *dst,
 			req->window_clamp = tcp_full_space(sk);
 
 		tcp_select_initial_window(tcp_full_space(sk),
-			mss - (ireq->tstamp_ok && !mptcp_req_sk_saw_mpc(req) ? TCPOLEN_TSTAMP_ALIGNED : 0),
+			mss - (ireq->tstamp_ok ? TCPOLEN_TSTAMP_ALIGNED : 0) -
+			(tcp_rsk(req)->saw_mpc ? MPTCP_SUB_LEN_DSM_ALIGN : 0),
 			&req->rcv_wnd,
 			&req->window_clamp,
 			ireq->wscale_ok,
@@ -2632,12 +2628,7 @@ static void tcp_connect_init(struct sock *sk)
 
 	if (!tp->window_clamp)
 		tp->window_clamp = dst_metric(dst, RTAX_WINDOW);
-
-	if (mptcp_doit(sk))
-		tp->advmss = mptcp_sysctl_mss();
-	else
-		tp->advmss = dst_metric_advmss(dst);
-
+	tp->advmss = dst_metric_advmss(dst);
 	if (tp->rx_opt.user_mss && tp->rx_opt.user_mss < tp->advmss)
 		tp->advmss = tp->rx_opt.user_mss;
 
@@ -2676,15 +2667,13 @@ static void tcp_connect_init(struct sock *sk)
 
 #ifdef CONFIG_MPTCP
 	if (mptcp_doit(sk)) {
-		if (tp->mpc) {
+		if (is_master_tp(tp)) {
+			tp->request_mptcp = 1;
+			mptcp_connect_init(tp);
+		} else {
 			tp->mptcp->snt_isn = tp->write_seq;
 			tp->mptcp->init_rcv_wnd = tp->rcv_wnd;
 		}
-
-		tp->request_mptcp = 1;
-
-		if (is_master_tp(tp))
-			mptcp_connect_init(tp);
 	}
 #endif
 }

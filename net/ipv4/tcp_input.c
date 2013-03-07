@@ -73,6 +73,8 @@
 #include <asm/unaligned.h>
 #include <net/netdma.h>
 #include <net/mptcp.h>
+#include <net/mptcp_v4.h>
+#include <net/mptcp_v6.h>
 
 int sysctl_tcp_timestamps __read_mostly = 1;
 int sysctl_tcp_window_scaling __read_mostly = 1;
@@ -3312,7 +3314,8 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 		if (!fully_acked)
 			break;
 
-		mptcp_clean_rtx_infinite(skb, sk);
+		if (tp->mpc)
+			mptcp_clean_rtx_infinite(skb, sk);
 		tcp_unlink_write_queue(skb, sk);
 
 		if (tp->mpc)
@@ -3461,10 +3464,6 @@ static int tcp_ack_update_window(struct sock *sk, struct sk_buff *skb, u32 ack,
 	int flag = 0;
 	u32 nwin = ntohs(tcp_hdr(skb)->window);
 
-	/* Window-updates are handled in mptcp_data_ack */
-	if (tp->mpc)
-		goto no_window_update;
-
 	if (likely(!tcp_hdr(skb)->syn))
 		nwin <<= tp->rx_opt.snd_wscale;
 
@@ -3488,7 +3487,6 @@ static int tcp_ack_update_window(struct sock *sk, struct sk_buff *skb, u32 ack,
 		}
 	}
 
-no_window_update:
 	tp->snd_una = ack;
 
 	return flag;
@@ -3703,10 +3701,6 @@ static int tcp_ack(struct sock *sk, struct sk_buff *skb, int flag)
 		tcp_ca_event(sk, CA_EVENT_SLOW_ACK);
 	}
 
-	flag |= mptcp_data_ack(sk, skb);
-	if (unlikely(tp->mp_killed))
-		return -1;
-
 	/* We passed data and got it acked, remove any soft error
 	 * log. Something worked...
 	 */
@@ -3776,10 +3770,8 @@ old_ack:
  * But, this can also be called on packets in the established flow when
  * the fast version below fails.
  */
-static void __tcp_parse_options(const struct sk_buff *skb,
-				struct tcp_options_received *opt_rx,
-				const u8 **hvpp, struct multipath_options *mopt,
-				int estab, int fast)
+void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *opt_rx,
+		       const u8 **hvpp, struct mptcp_options_received *mopt, int estab)
 {
 	unsigned char *ptr;
 	struct tcphdr *th = tcp_hdr(skb);
@@ -3888,13 +3880,8 @@ static void __tcp_parse_options(const struct sk_buff *skb,
 				}
 				break;
 			case TCPOPT_MPTCP:
-				/* Does not parse TCP options if coming from
-				 * tcp_fast_parse_options. They will be parsed
-				 * later.
-				 */
-				if (!fast)
-					mptcp_parse_options(ptr - 2, opsize,
-							    opt_rx, mopt, skb);
+				mptcp_parse_options(ptr - 2, opsize, opt_rx,
+						    mopt, skb);
 				break;
 			}
 
@@ -3902,12 +3889,6 @@ static void __tcp_parse_options(const struct sk_buff *skb,
 			length -= opsize;
 		}
 	}
-}
-
-void tcp_parse_options(const struct sk_buff *skb, struct tcp_options_received *opt_rx,
-		       const u8 **hvpp, struct multipath_options *mopt, int estab)
-{
-	__tcp_parse_options(skb, opt_rx, hvpp, mopt, estab, 0);
 }
 EXPORT_SYMBOL(tcp_parse_options);
 
@@ -3930,8 +3911,9 @@ static int tcp_parse_aligned_timestamp(struct tcp_sock *tp, struct tcphdr *th)
 /* Fast parse options. This hopes to only see timestamps.
  * If it is wrong it falls back on tcp_parse_options().
  */
-static int tcp_fast_parse_options(struct sk_buff *skb, struct tcphdr *th,
-				struct tcp_sock *tp, const u8 **hvpp)
+static bool tcp_fast_parse_options(const struct sk_buff *skb,
+				   const struct tcphdr *th,
+				   struct tcp_sock *tp, const u8 **hvpp)
 {
 	/* In the spirit of fast parsing, compare doff directly to constant
 	 * values.  Because equality is used, short doff can be ignored here.
@@ -3944,8 +3926,8 @@ static int tcp_fast_parse_options(struct sk_buff *skb, struct tcphdr *th,
 		if (tcp_parse_aligned_timestamp(tp, th))
 			return 1;
 	}
-	__tcp_parse_options(skb, &tp->rx_opt, hvpp,
-			    tp->mpc ? &tp->mpcb->rx_opt : NULL, 1, 1);
+	tcp_parse_options(skb, &tp->rx_opt, hvpp,
+			    tp->mpc ? &tp->mptcp->rx_opt : NULL, 1);
 
 	return 1;
 }
@@ -4119,7 +4101,7 @@ void tcp_reset(struct sock *sk)
  *
  *	If we are in FINWAIT-2, a received FIN moves us to TIME-WAIT.
  */
-static void tcp_fin(struct sock *sk, const struct sk_buff *skb)
+static void tcp_fin(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -4407,7 +4389,7 @@ static void tcp_ofo_queue(struct sock *sk)
 		__skb_queue_tail(&sk->sk_receive_queue, skb);
 		tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
 		if (tcp_hdr(skb)->fin)
-			tcp_fin(sk, skb);
+			tcp_fin(sk);
 	}
 }
 
@@ -4495,7 +4477,7 @@ queue_and_out:
 		if (skb->len || mptcp_is_data_fin(skb))
 			tcp_event_data_recv(sk, skb);
 		if (th->fin)
-			tcp_fin(sk, skb);
+			tcp_fin(sk);
 
 		if (!skb_queue_empty(&tp->out_of_order_queue)) {
 			tcp_ofo_queue(sk);
@@ -4988,12 +4970,12 @@ static int tcp_should_expand_sndbuf(struct sock *sk)
 
 			/* Backup-flows have to be counted - if there is no other
 			 * subflow we take the backup-flow into account. */
-			if (tp_it->rx_opt.low_prio || tp_it->mptcp->low_prio) {
+			if (tp_it->mptcp->rcv_low_prio || tp_it->mptcp->low_prio) {
 				cnt_backups++;
 			}
 
 			if (tp_it->packets_out < tp_it->snd_cwnd) {
-				if (tp_it->rx_opt.low_prio || tp_it->mptcp->low_prio) {
+				if (tp_it->mptcp->rcv_low_prio || tp_it->mptcp->low_prio) {
 					backup_available = 1;
 					continue;
 				}
@@ -5002,7 +4984,7 @@ static int tcp_should_expand_sndbuf(struct sock *sk)
 		}
 
 		/* Backup-flow is available for sending - update send-buffer */
-		if (cnt_backups == tp->mpcb->cnt_subflows && backup_available)
+		if (tp->mpcb->cnt_established == cnt_backups && backup_available)
 			return 1;
 		return 0;
 	}
@@ -5304,7 +5286,7 @@ out:
  * play significant role here.
  */
 static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
-			      struct tcphdr *th, int syn_inerr)
+			     	 struct tcphdr *th, int syn_inerr)
 {
 	const u8 *hash_location;
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -5357,18 +5339,14 @@ static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
 	}
 
 	/* If valid: post process the received MPTCP options. */
-	if (tp->mpc) {
-		mptcp_post_parse_options(tp, skb);
-
-		mptcp_path_array_check(mptcp_meta_sk(sk));
-		/* Socket may have been mp_killed by a REMOVE_ADDR */
-		if (tp->mp_killed || mptcp_mp_fail_rcvd(sk, th))
-			goto discard;
-	}
+	if (tp->mpc && mptcp_handle_options(sk, th, skb))
+		goto discard;
 
 	return 1;
 
 discard:
+	if (tp->mpc)
+		mptcp_reset_mopt(tp);
 	__kfree_skb(skb);
 	return 0;
 }
@@ -5397,7 +5375,7 @@ discard:
  *	tcp_data_queue when everything is OK.
  */
 int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
-			struct tcphdr *th, unsigned len)
+			struct tcphdr *th, unsigned int len)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	int res;
@@ -5619,12 +5597,11 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_cookie_values *cvp = tp->cookie_values;
 	int saved_clamp = tp->rx_opt.mss_clamp;
-	struct multipath_options mopt;
-	struct mptcp_cb *mpcb = tp->mpc ? tp->mpcb : NULL;
+	struct mptcp_options_received mopt;
 	mptcp_init_mp_opt(&mopt);
 
 	tcp_parse_options(skb, &tp->rx_opt, &hash_location,
-			  mpcb ? &tp->mpcb->rx_opt : &mopt, 0);
+			  tp->mpc ? &tp->mptcp->rx_opt : &mopt, 0);
 
 	if (th->ack) {
 		/* rfc793:
@@ -5674,14 +5651,15 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 #ifdef CONFIG_MPTCP
 		if (!is_master_tp(tp)) {
 			u8 hash_mac_check[20];
+			struct mptcp_cb *mpcb = tp->mpcb;
 
 			mptcp_hmac_sha1((u8 *)&mpcb->mptcp_rem_key,
 					(u8 *)&mpcb->mptcp_loc_key,
-					(u8 *)&tp->rx_opt.mptcp_recv_nonce,
+					(u8 *)&tp->mptcp->rx_opt.mptcp_recv_nonce,
 					(u8 *)&tp->mptcp->mptcp_loc_nonce,
 					(u32 *)hash_mac_check);
 			if (memcmp(hash_mac_check,
-				   (char *)&tp->rx_opt.mptcp_recv_tmac, 8)) {
+				   (char *)&tp->mptcp->rx_opt.mptcp_recv_tmac, 8)) {
 				sock_orphan(sk);
 				tp->mptcp->teardown = 1;
 				goto reset_and_undo;
@@ -5691,7 +5669,8 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 			 * until the 4th ack arrives.
 			 */
 			tp->mptcp->pre_established = 1;
-		} else if (tp->rx_opt.saw_mpc && tp->request_mptcp) {
+			tp->mptcp->rcv_low_prio = tp->mptcp->rx_opt.low_prio;
+		} else if (mopt.saw_mpc && tp->request_mptcp) {
 			if (mptcp_create_master_sk(sk, mopt.mptcp_rem_key,
 						   ntohs(th->window)))
 				goto discard;
@@ -5703,18 +5682,12 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 			 * by tcp_connect for the SYN
 			 */
 			tp->mptcp->snt_isn = tp->snd_nxt - 1;
-
-			mpcb = tp->mpcb;
-
-			mpcb->rx_opt.dss_csum = mopt.dss_csum;
-			mpcb->rx_opt.mpcb = mpcb;
-			mpcb->rx_opt.list_rcvd = 1;
+			tp->mpcb->dss_csum = mopt.dss_csum;
 
 			sk_set_socket(sk, mptcp_meta_sk(sk)->sk_socket);
 			sk->sk_wq = mptcp_meta_sk(sk)->sk_wq;
 
 			mptcp_update_metasocket(sk, mptcp_meta_sk(sk));
-			mptcp_path_array_check(mptcp_meta_sk(sk));
 
 			 /* hold in mptcp_inherit_sk due to initialization to 2 */
 			sock_put(sk);
@@ -5724,7 +5697,10 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 			if (tp->inside_tk_table)
 				mptcp_hash_remove(tp);
 		}
-		mptcp_include_mpc(tp);
+		if (tp->mpc) {
+			tp->mptcp->rcv_isn = TCP_SKB_CB(skb)->seq;
+			tp->mptcp->include_mpc = 1;
+		}
 #endif
 
 		/* rfc793:
@@ -5738,23 +5714,18 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 
 		tp->snd_wl1 = TCP_SKB_CB(skb)->seq;
 		tcp_ack(sk, skb, FLAG_SLOWPATH);
-		if (unlikely(tp->mp_killed))
-			goto discard;
 
 		/* Ok.. it's good. Set up sequence numbers and
 		 * move to established.
 		 */
 #ifdef CONFIG_MPTCP
-		if (tp->mpc) {
-			tp->rx_opt.rcv_isn = TCP_SKB_CB(skb)->seq;
-
-			if (!is_master_tp(tp))
-				/* Timer for repeating the ACK until an answer
-				 * arrives. Used only when establishing an additional
-				 * subflow inside of an MPTCP connection.
-				 */
-				sk_reset_timer(sk, &tp->mptcp->mptcp_ack_timer,
-					       jiffies + icsk->icsk_rto);
+		if (tp->mpc && !is_master_tp(tp)) {
+			/* Timer for repeating the ACK until an answer
+			 * arrives. Used only when establishing an additional
+			 * subflow inside of an MPTCP connection.
+			 */
+			sk_reset_timer(sk, &tp->mptcp->mptcp_ack_timer,
+				       jiffies + icsk->icsk_rto);
 		}
 #endif
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
@@ -5775,11 +5746,15 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 			tp->rx_opt.tstamp_ok	   = 1;
 			tp->tcp_header_len =
 				sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED;
-			if (!tp->mpc)
-				tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+			tp->advmss	    -= TCPOLEN_TSTAMP_ALIGNED;
 			tcp_store_ts_recent(tp);
 		} else {
 			tp->tcp_header_len = sizeof(struct tcphdr);
+		}
+
+		if (tp->mpc) {
+			tp->tcp_header_len += MPTCP_SUB_LEN_DSM_ALIGN;
+			tp->advmss -= MPTCP_SUB_LEN_DSM_ALIGN;
 		}
 
 		if (tcp_is_sack(tp) && sysctl_tcp_fack)
@@ -5913,6 +5888,11 @@ discard:
 			tp->tcp_header_len = sizeof(struct tcphdr);
 		}
 
+		if (tp->mpc) {
+			tp->tcp_header_len += MPTCP_SUB_LEN_DSM_ALIGN;
+			tp->advmss -= MPTCP_SUB_LEN_DSM_ALIGN;
+		}
+
 		tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
 
@@ -5989,17 +5969,10 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 			goto discard;
 
 		if (th->syn) {
-			res = icsk->icsk_af_ops->conn_request(sk, skb);
-			if (res < 0) {
-				/* MPTCP - if the skb has been put in the
-				 * backlog-queue, conn_request returns -2.
-				 * By returning 0, tcp_vX_do_rcv will not
-				 * free skb.
-				 */
-				if (res == -2)
-					return 0;
+			if (th->fin)
+				goto discard;
+			if (icsk->icsk_af_ops->conn_request(sk, skb) < 0)
 				return 1;
-			}
 
 			/* Now we have several options: In theory there is
 			 * nothing else in the frame. KA9Q has an option to
@@ -6036,6 +6009,8 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		tcp_urg(sk, skb, th);
 		__kfree_skb(skb);
 		tcp_data_snd_check(sk);
+		if (tp->mpc && is_master_tp(tp))
+			bh_unlock_sock(sk);
 		return 0;
 	}
 
@@ -6082,8 +6057,10 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 				 */
 				tcp_ack_update_rtt(sk, 0, 0);
 
-				if (!tp->mpc && tp->rx_opt.tstamp_ok)
+				if (tp->rx_opt.tstamp_ok)
 					tp->advmss -= TCPOLEN_TSTAMP_ALIGNED;
+				if (tp->mpc)
+					tp->advmss -= MPTCP_SUB_LEN_DSM_ALIGN;
 
 				/* Make sure socket is routed, for
 				 * correct metrics.
