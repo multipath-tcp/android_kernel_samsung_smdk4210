@@ -22,6 +22,7 @@
 
 #ifdef CONFIG_CMA
 #include <linux/cma.h>
+#include <linux/exynos_mem.h>
 void __init s5p_cma_region_reserve(struct cma_region *regions_normal,
 				      struct cma_region *regions_secure,
 				      size_t align_secure, const char *map)
@@ -53,19 +54,25 @@ void __init s5p_cma_region_reserve(struct cma_region *regions_normal,
 			if (!memblock_is_region_reserved(reg->start, reg->size)
 			    && (memblock_reserve(reg->start, reg->size) == 0))
 				reg->reserved = 1;
-			else
+			else {
 				pr_err("S5P/CMA: Failed to reserve '%s'\n",
 								reg->name);
+                continue;
+            }
 
-			if (reg->reserved)
-				pr_debug("S5P/CMA: "
-					"Reserved 0x%08x/0x%08x for '%s'\n",
-					reg->start, reg->size, reg->name);
-			continue;
+			pr_debug("S5P/CMA: "
+				 "Reserved 0x%08x/0x%08x for '%s'\n",
+				 reg->start, reg->size, reg->name);
+			
+			cma_region_descriptor_add(reg->name, reg->start, reg->size);
+
+			paddr = reg->start;
+		} else {
+			paddr = memblock_find_in_range(0,
+					MEMBLOCK_ALLOC_ACCESSIBLE,
+					reg->size, reg->alignment);
 		}
 
-		paddr = memblock_find_in_range(0, MEMBLOCK_ALLOC_ACCESSIBLE,
-						reg->size, reg->alignment);
 		if (paddr != MEMBLOCK_ERROR) {
 			if (memblock_reserve(paddr, reg->size)) {
 				pr_err("S5P/CMA: Failed to reserve '%s'\n",
@@ -75,6 +82,10 @@ void __init s5p_cma_region_reserve(struct cma_region *regions_normal,
 
 			reg->start = paddr;
 			reg->reserved = 1;
+
+			pr_debug("S5P/CMA: Reserved 0x%08x/0x%08x for '%s'\n",
+						reg->start, reg->size, reg->name);
+			cma_region_descriptor_add(reg->name, reg->start, reg->size);
 		} else {
 			pr_err("S5P/CMA: No free space in memory for '%s'\n",
 								reg->name);
@@ -117,6 +128,9 @@ void __init s5p_cma_region_reserve(struct cma_region *regions_normal,
 		}
 
 		if (paddr_last) {
+			pr_info("S5P/CMA: "
+				"Reserved 0x%08x/0x%08x for 'secure_region'\n",
+				paddr_last, size_secure);
 			while (memblock_reserve(paddr_last, size_secure))
 				paddr_last -= align_secure;
 
@@ -128,6 +142,9 @@ void __init s5p_cma_region_reserve(struct cma_region *regions_normal,
 				pr_debug("S5P/CMA: "
 					"Reserved 0x%08x/0x%08x for '%s'\n",
 					reg->start, reg->size, reg->name);
+
+				cma_region_descriptor_add(reg->name, reg->start, reg->size);
+
 				if (cma_early_region_register(reg)) {
 					memblock_free(reg->start, reg->size);
 					pr_err("S5P/CMA: "
